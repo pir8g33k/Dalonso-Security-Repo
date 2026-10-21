@@ -1,0 +1,94 @@
+id: 5b2d9e47-1c83-4f60-8a7e-2d4b6c9e05f1
+name: "Fortinet Web Filter Blocked Web Access"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate web filter events where a page, download or URL was blocked by category or
+  by reputation scoring before reaching the user. Web filtering is one of the most commonly
+  deployed phishing and malware delivery controls on a FortiGate estate, so a block on a newly
+  registered or uncategorised site is a high value early warning that a phishing link or a
+  drive-by download reached an internal user. The benign case is a user browsing a category that
+  the organisation deliberately blocks, such as adult content, gambling or newly observed cloud
+  storage, so check the requested URL, the identity of the user and the configured filter
+  category before escalating to an incident. The web filter category is carried in the CEF cs1
+  field and in the catdesc extension of the raw CEF string, so confirm which of the two the
+  connector populates in the target workspace before using the category for tuning.
+  MITRE ATT&CK: T1566.002, T1071.001
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - CommandAndControl
+relevantTechniques:
+  - T1566.002
+  - T1071.001
+query: |
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("webfilter") or Activity has_any ("webfilter", "web-filter")
+  | where tolower(tostring(DeviceAction)) in ("blocked", "deny", "close", "reset", "timeout")
+  | extend WebCategory = iff(
+      isnotempty(DeviceCustomString1),
+      tostring(DeviceCustomString1),
+      tostring(extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions))))
+  | extend BlockedURL = tostring(RequestURL)
+  | extend BlockedHost = tostring(DestinationHostName)
+  | summarize
+      BlockCount   = count(),
+      Categories   = tostring(make_set(WebCategory, 10)),
+      CategoryList = tostring(make_set(WebCategory, 10)),
+      UserList     = tostring(make_set(SourceUserName, 10)),
+      Account      = arg_max(SourceUserName, TimeGenerated),
+      URLList      = tostring(make_set(BlockedURL, 5)),
+      MatchedURL   = arg_max(BlockedURL, TimeGenerated),
+      HostList     = tostring(make_set(BlockedHost, 10)),
+      Destinations = tostring(make_set(DestinationIP, 10)),
+      FirstSeen    = min(TimeGenerated),
+      LastSeen     = max(TimeGenerated)
+    by SourceIP, WebCategory
+  | order by BlockCount desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+  - entityType: URL
+    fieldMappings:
+      - identifier: Url
+        columnName: MatchedURL
+customDetails:
+  BlockCount: BlockCount
+  WebCategory: WebCategory
+  CategoryList: CategoryList
+  UserList: UserList
+  URLList: URLList
+  HostList: HostList
+  Destinations: Destinations
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet Web Filter Block - {{SourceIP}} ({{WebCategory}})"
+  alertDescriptionFormat: "Web filter blocked {{BlockCount}} requests from {{SourceIP}} in category {{WebCategory}}. User(s) {{UserList}}, URLs {{URLList}}, hosts {{HostList}}. Review for phishing links or drive-by downloads reaching internal users."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []

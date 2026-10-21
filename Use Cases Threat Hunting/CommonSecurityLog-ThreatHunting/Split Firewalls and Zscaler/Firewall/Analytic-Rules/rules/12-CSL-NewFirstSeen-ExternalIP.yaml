@@ -3,11 +3,14 @@ name: "Firewall New First-Seen External IP Contacted"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Identifies external IPs that received more than 5 allowed firewall connections in the
-  last 24 hours but were not observed at all during the prior 7-day baseline period.
-  Newly appearing external IPs with significant connection volume may indicate freshly
-  registered attacker infrastructure, a newly activated C2 domain, or an exfiltration
-  channel set up after initial compromise.
+  Identifies external IPs that received more than 5 permitted firewall connections in
+  the last 6 hours but were not observed at all during the prior 30-day baseline.
+  A newly appearing external IP with real connection volume may be freshly registered
+  attacker infrastructure, a newly activated C2 domain, or an exfiltration channel
+  set up after initial compromise.
+  The recent window now matches the schedule exactly. Previously the rule compared a
+  24 hour recent window against a 7 day baseline on a 6 hour schedule, so the same
+  new IP re-alerted on every run for a full day.
   MITRE ATT&CK: T1071 (Application Layer Protocol)
 severity: Medium
 requiredDataConnectors:
@@ -15,7 +18,7 @@ requiredDataConnectors:
     dataTypes:
       - CommonSecurityLog
 queryFrequency: 6h
-queryPeriod: 7d
+queryPeriod: 6h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -23,19 +26,29 @@ tactics:
 relevantTechniques:
   - T1071
 query: |
+  let lookback = 6h;
+  let historyWindow = 30d;
+  let minConnections = 5;
   let HistoricalIPs =
       CommonSecurityLog
-      | where TimeGenerated between (ago(7d) .. ago(1d))
+      | where TimeGenerated between (ago(historyWindow) .. ago(lookback))
       | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-      | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+      | where isnotempty(DestinationIP)
       | where ipv4_is_private(DestinationIP) == false
       | summarize by DestinationIP;
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
-  | where ipv4_is_private(DestinationIP) == false
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(DestinationIP)
+  | where ipv4_is_private(DestinationIP) == false
   | summarize
       ConnectionCount  = count(),
       SourceIPs        = make_set(SourceIP, 20),
@@ -45,7 +58,7 @@ query: |
       DeviceVendors    = make_set(DeviceVendor),
       FirstSeen        = min(TimeGenerated)
     by DestinationIP
-  | where ConnectionCount > 5
+  | where ConnectionCount > minConnections
   | join kind=leftanti HistoricalIPs on DestinationIP
   | order by ConnectionCount desc
 entityMappings:

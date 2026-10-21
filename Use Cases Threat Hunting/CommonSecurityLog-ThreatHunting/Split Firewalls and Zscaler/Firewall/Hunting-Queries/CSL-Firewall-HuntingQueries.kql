@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // CommonSecurityLog - Firewall Threat Hunting Queries (Fortinet / Palo Alto / All Vendors)
 // Vendor: Fortinet FortiGate, Palo Alto Networks, All Vendors
 // Generated: 2026-03-18
@@ -14,15 +14,19 @@
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
-| where isnotempty(DestinationIP)
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
+| where ipv4_is_private(SourceIP) == true
 | where ipv4_is_private(DestinationIP) == false
-| where isnotempty(SourceIP)
+| where not(ipv4_is_in_range(DestinationIP, "100.64.0.0/10"))
+| where not(ipv4_is_in_range(DestinationIP, "169.254.0.0/16"))
+| where not(ipv4_is_in_range(DestinationIP, "224.0.0.0/4"))
 | summarize
     ConnectionCount  = count(),
     BytesSent        = sum(SentBytes),
     BytesReceived    = sum(ReceivedBytes),
     HourlyBuckets    = dcount(bin(TimeGenerated, 1h)),
+    ActiveMinutes    = dcount(bin(TimeGenerated, 1m)),
     Ports            = make_set(DestinationPort, 10),
     FirstSeen        = min(TimeGenerated),
     LastSeen         = max(TimeGenerated)
@@ -41,7 +45,7 @@ CommonSecurityLog
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
 | where isnotempty(SourceIP) and isnotempty(DestinationIP)
 | where ipv4_is_private(SourceIP) == true
 | where ipv4_is_private(DestinationIP) == false
@@ -49,13 +53,21 @@ CommonSecurityLog
     TotalBytesSent    = sum(SentBytes),
     TotalBytesRecv    = sum(ReceivedBytes),
     SessionCount      = count(),
+    DestIPCount       = dcount(DestinationIP),
     DestIPs           = make_set(DestinationIP, 20),
     DestPorts         = make_set(DestinationPort, 10),
+    DestHostNames     = make_set(DestinationHostName, 10),
+    Users             = make_set(SourceUserName, 10),
     HourlyBuckets     = dcount(bin(TimeGenerated, 1h)),
     DeviceVendors     = make_set(DeviceVendor)
   by SourceIP
 | extend TotalMBSent = round(toreal(TotalBytesSent) / 1048576, 2)
-| where TotalMBSent > 500
+| extend TotalMBRecv = round(toreal(TotalBytesRecv) / 1048576, 2)
+| extend OutboundRatio = iff(isnull(TotalMBRecv) or TotalMBRecv <= 0,
+                        0.0,
+                        round(TotalMBSent / TotalMBRecv, 2))
+| where TotalMBSent > 200
+     and (DestIPCount >= 10 or OutboundRatio >= 5)
 | order by TotalMBSent desc
 
 // =============================================================================
@@ -68,16 +80,17 @@ let TI_IPs =
     ThreatIntelIndicators
     | where TimeGenerated > ago(30d)
     | where isempty(ValidUntil) or ValidUntil > now()
-    | where isnotnull(parse_ipv4(ObservableValue))
-    | where isnotempty(ObservableValue)
-    | summarize ThreatTypes = make_set(Tags), ConfidenceScore = max(Confidence)
-        by TI_IP = ObservableValue;
+    | where ObservableKey has "ip"
+    | where ipv4_is_valid(ObservableValue)
+    | summarize ThreatTypes = make_set(tostring(Tags), 10), ConfidenceScore = max(Confidence)
+        by TI_IP = tolower(tostring(ObservableValue));
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
 | where isnotempty(DestinationIP) or isnotempty(SourceIP)
-| extend CheckIP = iff(ipv4_is_private(DestinationIP) == false, DestinationIP, SourceIP)
+| extend CheckIP = tolower(tostring(iff(ipv4_is_private(DestinationIP) == false,
+|                                           DestinationIP, SourceIP)))
 | join kind=inner TI_IPs on $left.CheckIP == $right.TI_IP
 | summarize
     HitCount         = count(),
@@ -122,18 +135,19 @@ CommonSecurityLog
 // Tactics        : InitialAccess,Exfiltration
 // Description    : Detects allowed firewall traffic to/from APT-associated countries.
 // =============================================================================
-let HighRiskCountries = dynamic([
-    "China", "Russia", "North Korea", "Iran", "Syria",
-    "Cuba", "Belarus", "Venezuela", "Afghanistan", "Libya"]);
+// ISO 3166-1 alpha-2 codes. Matching on the English country name does not
+// reliably match what geo_info_from_ip_address actually returns.
+let HighRiskCountryCodes = dynamic([
+    "CN", "RU", "KP", "IR", "SY", "CU", "BY", "VE", "AF", "LY"]);
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
-| where isnotempty(DestinationIP) or isnotempty(SourceIP)
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
 | extend
-    DstCountry = tostring(geo_info_from_ip_address(DestinationIP).country),
-    SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country)
-| where DstCountry in (HighRiskCountries) or SrcCountry in (HighRiskCountries)
+    DstCountry = tostring(geo_info_from_ip_address(DestinationIP).country_2),
+    SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| where DstCountry in (HighRiskCountryCodes) or SrcCountry in (HighRiskCountryCodes)
 | summarize
     ConnectionCount  = count(),
     BytesSent        = sum(SentBytes),
@@ -150,19 +164,28 @@ CommonSecurityLog
 // Tactics        : LateralMovement
 // Description    : Detects an internal IP connecting to many internal hosts on SMB, RDP, WinRM, SSH, or database ports.
 // =============================================================================
-let LateralPorts = dynamic([22, 23, 135, 139, 445, 3389, 5985, 5986, 1433, 3306, 5432]);
+// DestinationPort is a STRING column in CommonSecurityLog. The previous
+// integer list never matched, so this hunt could never return a result.
+let LateralPorts = dynamic([
+    "22", "23", "135", "139", "445", "3389", "5985", "5986",
+    "1433", "1434", "3306", "5432", "1521", "8080"]);
 CommonSecurityLog
 | where TimeGenerated > ago(6h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks")
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
 | where ipv4_is_private(SourceIP) == true
 | where ipv4_is_private(DestinationIP) == true
-| where DestinationPort in (LateralPorts)
+| where SourceIP != DestinationIP
+| extend DstPort = tostring(DestinationPort)
+| where DstPort in (LateralPorts)
 | summarize
     UniqueTargets   = dcount(DestinationIP),
-    UniquePorts     = dcount(DestinationPort),
+    UniquePorts     = dcount(DstPort),
     TotalAttempts   = count(),
+    AcceptedAttempts = countif(tolower(DeviceAction) in ("accept", "allowed", "allow")),
     TargetIPs       = make_set(DestinationIP, 30),
-    PortsUsed       = make_set(DestinationPort, 10),
+    PortsUsed       = make_set(DstPort, 10),
+    Users           = make_set(SourceUserName, 10),
     Actions         = make_set(DeviceAction, 5),
     FirstSeen       = min(TimeGenerated),
     LastSeen        = max(TimeGenerated)
@@ -176,20 +199,38 @@ CommonSecurityLog
 // Tactics        : InitialAccess,Execution
 // Description    : Surfaces Fortinet IPS events grouped by signature name and source IP.
 // =============================================================================
+// FortiGate carries the log category in DeviceEventClassID and the subtype
+// in Activity; which one is populated depends on the ingestion path, so both
+// are tested. The IPS signature name lives in DeviceCustomString1 on many
+// connectors and in the catdesc key of AdditionalExtensions on others.
+let utmCategories = dynamic(["utm", "antivirus", "webfilter", "app-ctrl", "ssl"]);
+let utmSubtypes  = dynamic(["ips", "ips-packet", "av", "antibot", "file-block",
+                            "appctrl", "webfilter", "fct-utm", "ips-anomaly",
+                            "av-anomaly"]);
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor == "Fortinet"
-| where DeviceEventClassID has_any ("IPS", "anomaly", "signature")
-    or Activity has_any ("ips-packet", "app-ctrl", "anomaly")
+| where tolower(DeviceEventClassID) in (utmCategories)
+    or tolower(Activity) in (utmSubtypes)
+| extend IPSSignature = iff(isnotempty(DeviceCustomString1),
+                            tostring(DeviceCustomString1),
+                            extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions)))
+| extend IPSSignature = iff(isempty(IPSSignature), tostring(Activity), IPSSignature)
 | summarize
     HitCount         = count(),
+    BlockedCount     = countif(tolower(DeviceAction) == "blocked"),
+    DetectedCount    = countif(tolower(DeviceAction) == "accept"),
     SourceIPs        = make_set(SourceIP, 20),
     DestinationIPs   = make_set(DestinationIP, 20),
+    Users            = make_set(SourceUserName, 10),
+    RequestURLs      = make_set(RequestURL, 10),
     ProtocolsUsed    = make_set(Protocol, 5),
     SeverityValues   = make_set(LogSeverity, 5),
     FirstSeen        = min(TimeGenerated),
     LastSeen         = max(TimeGenerated)
-  by Activity, DeviceEventClassID
+  by IPSSignature
+| extend Enforcement = iff(BlockedCount == 0, "Detected but NOT blocked",
+                      iff(DetectedCount == 0, "Blocked", "Mixed"))
 | order by HitCount desc
 
 // =============================================================================
@@ -225,13 +266,14 @@ let HistoricalIPs =
     CommonSecurityLog
     | where TimeGenerated between (ago(7d) .. ago(1d))
     | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-    | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+    | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+    | where isnotempty(DestinationIP)
     | where ipv4_is_private(DestinationIP) == false
     | summarize by DestinationIP;
 CommonSecurityLog
 | where TimeGenerated > ago(1d)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
 | where ipv4_is_private(DestinationIP) == false
 | where isnotempty(DestinationIP)
 | summarize
@@ -257,17 +299,19 @@ let FirewallExternalIPs =
     CommonSecurityLog
     | where TimeGenerated > ago(24h)
     | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-    | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+    | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+    | where isnotempty(DestinationIP)
     | where ipv4_is_private(DestinationIP) == false
     | summarize
         FW_Connections = count(),
         FW_Sources     = make_set(SourceIP, 10),
         FW_BytesSent   = sum(SentBytes),
         FW_Vendors     = make_set(DeviceVendor)
-      by ExternalIP = DestinationIP;
+      by ExternalIP = tolower(tostring(DestinationIP));
 SigninLogs
 | where TimeGenerated > ago(24h)
-| where ResultType == 0
+// ResultType is a string column; the previous integer comparison never matched.
+| where tostring(ResultType) == "0"
 | where isnotempty(IPAddress)
 | summarize
     AAD_SignInCount  = count(),
@@ -275,7 +319,7 @@ SigninLogs
     AAD_AppNames     = make_set(AppDisplayName, 10),
     AAD_Countries    = make_set(Location, 5),
     AAD_RiskLevels   = make_set(RiskLevelDuringSignIn, 5)
-  by IPAddress
+  by IPAddress = tolower(tostring(IPAddress))
 | join kind=inner FirewallExternalIPs on $left.IPAddress == $right.ExternalIP
 | project
     IPAddress,
@@ -301,7 +345,7 @@ let AlertIPs =
     | where AlertSeverity in ("High", "Medium")
     | mv-expand todynamic(Entities)
     | where Entities.Type == "ip"
-    | extend AlertIP = tostring(Entities.Address)
+    | extend AlertIP = tolower(tostring(Entities.Address))
     | where isnotempty(AlertIP)
     | summarize
         AlertCount    = count(),
@@ -312,8 +356,11 @@ let AlertIPs =
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
+// This query had no DeviceAction filter, so it matched blocked traffic too.
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
 | where isnotempty(SourceIP) or isnotempty(DestinationIP)
-| extend CheckIP = iff(ipv4_is_private(DestinationIP) == false, DestinationIP, SourceIP)
+| extend CheckIP = tolower(tostring(iff(ipv4_is_private(DestinationIP) == false,
+|                                           DestinationIP, SourceIP)))
 | summarize
     FW_HitCount     = count(),
     FW_Actions      = make_set(DeviceAction, 5),
@@ -352,7 +399,7 @@ let TI_Domains =
     | summarize
         TI_ThreatTypes = make_set(Tags),
         TI_Confidence  = max(Confidence)
-      by DomainName = ObservableValue;
+      by DomainName = tolower(tostring(ObservableValue));
 let TI_URLs =
     ThreatIntelIndicators
     | where TimeGenerated > ago(30d)
@@ -367,7 +414,16 @@ CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
 | where isnotempty(DestinationHostName) or isnotempty(RequestURL)
-| extend MatchKey = coalesce(DestinationHostName, RequestURL)
+// This query had no DeviceAction filter at all, so it matched blocked
+// traffic as well as permitted traffic. Restrict it to permitted sessions.
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
+// RequestURL is a full URL. Reduce it to a hostname before comparing it
+// with a domain indicator, and lower-case both sides.
+| extend MatchKey = tolower(tostring(
+    iff(isnotempty(DestinationHostName),
+       DestinationHostName,
+       extract(@"^https?://([^/:?#]+)", 1, tostring(RequestURL)))))
+| where isnotempty(MatchKey)
 | join kind=inner TI_Domains on $left.MatchKey == $right.DomainName
 | summarize
     FW_HitCount    = count(),
@@ -413,23 +469,41 @@ CommonSecurityLog
 // Tactics        : CredentialAccess
 // Description    : Detects brute force or credential stuffing against Fortinet VPN infrastructure.
 // =============================================================================
+// The previous version treated ANY deny as an authentication failure, so
+// every policy deny and UTM block in the estate was counted as a brute
+// force attempt. Require an authentication event first, then a failure.
+let authEventIDs = dynamic([
+    "0101000002", "0101000012", "0102000002", "0101001013",
+    "0101001057", "0101001058"]);
+let authSubtypes = dynamic([
+    "admin", "admin-login", "login", "loginfailed", "user", "auth",
+    "sslvpn", "ssl-vpn", "vpn", "vpn-login", "authenticate"]);
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor == "Fortinet"
-| where DeviceEventClassID has_any ("32001", "32002", "39424", "39952")
-    or Activity has_any ("ssl-vpn-tunnel", "vpn", "admin-login", "loginfailed",
-                         "login failure", "authentication failed")
-    or DeviceAction has_any ("failed", "denied", "reject", "failure")
+| extend EventID  = tolower(tostring(DeviceEventID))
+| extend Subtype  = tolower(tostring(Activity))
+| extend Category = tolower(tostring(DeviceEventClassID))
+| extend Outcome  = tolower(tostring(EventOutcome))
+| extend Action   = tolower(tostring(DeviceAction))
+| where EventID in (authEventIDs)
+    or Subtype in (authSubtypes)
+    or (Category == "event" and isnotempty(SourceUserName))
+| where Outcome has "fail"
+    or Action in ("deny", "reject", "failed", "failure")
 | summarize
     FailureCount     = count(),
     UniqueUsers      = dcount(SourceUserName),
     UserList         = make_set(SourceUserName, 20),
+    Subtypes         = make_set(Activity, 10),
+    EventIDs         = make_set(DeviceEventID, 10),
     DestinationIPs   = make_set(DestinationIP, 5),
     SourcePorts      = make_set(SourcePort, 5),
     FirstSeen        = min(TimeGenerated),
     LastSeen         = max(TimeGenerated)
-  by SourceIP, DeviceEventClassID
+  by SourceIP
 | where FailureCount > 5
+| extend SprayPattern = UniqueUsers >= 3
 | order by FailureCount desc
 
 // =============================================================================
@@ -441,21 +515,25 @@ CommonSecurityLog
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
-| where (ApplicationProtocol in ("HTTP", "http") and DestinationPort !in (80, 8080, 8000, 3128))
-    or (ApplicationProtocol in ("HTTPS", "https", "SSL", "ssl") and DestinationPort !in (443, 8443))
-    or (Protocol in ("HTTP", "http") and DestinationPort !in (80, 8080, 8000, 3128))
-    or (Protocol in ("HTTPS", "https") and DestinationPort !in (443, 8443))
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
+// DestinationPort is a STRING column, so the integer comparison never matched.
+// Protocol carries the transport protocol (TCP/UDP/ICMP) in CommonSecurityLog,
+// never HTTP, so those two branches were dead and have been removed.
+| extend AppProto = tolower(tostring(ApplicationProtocol))
+| extend DstPort = tostring(DestinationPort)
+| where (AppProto == "http" and DstPort !in ("80", "8080", "8000", "3128", "8888"))
+    or (AppProto in ("https", "ssl") and DstPort !in ("443", "8443", "4443"))
 | summarize
     ConnectionCount  = count(),
     SourceIPs        = make_set(SourceIP, 20),
     DestIPs          = make_set(DestinationIP, 20),
     BytesSent        = sum(SentBytes),
     URLSamples       = make_set(RequestURL, 10),
+    DestHostNames    = make_set(DestinationHostName, 10),
     DeviceVendors    = make_set(DeviceVendor),
     FirstSeen        = min(TimeGenerated),
     LastSeen         = max(TimeGenerated)
-  by DestinationPort, ApplicationProtocol, Protocol
+  by DstPort, AppProto
 | order by ConnectionCount desc
 
 // =============================================================================
@@ -474,12 +552,16 @@ let RiskyIdentities =
         Department       = any(Department),
         Manager          = any(Manager),
         IsAccountEnabled = any(IsAccountEnabled)
-      by AccountUPN;
+      by AccountUPN = tolower(tostring(AccountUPN));
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
 | where isnotempty(SourceUserName)
+// FortiGate writes the user as DOMAIN\user or user@domain, never as a bare
+// UPN, so the previous UPN-to-UPN join never matched. Use the local part.
+| extend UserLocal = tolower(tostring(split(split(tostring(SourceUserName), "@")[0], "\\")[0]))
+| where isnotempty(UserLocal)
 | summarize
     FW_RequestCount  = count(),
     FW_BytesSent     = sum(SentBytes),
@@ -488,7 +570,7 @@ CommonSecurityLog
     FW_Vendors       = make_set(DeviceVendor),
     FW_SrcIPs        = make_set(SourceIP, 5),
     FW_FirstSeen     = min(TimeGenerated)
-  by UserName = tolower(SourceUserName)
+  by UserName = UserLocal
 | join kind=inner RiskyIdentities on $left.UserName == $right.AccountUPN
 | extend TotalMBSent = round(toreal(FW_BytesSent) / 1048576, 2)
 | project

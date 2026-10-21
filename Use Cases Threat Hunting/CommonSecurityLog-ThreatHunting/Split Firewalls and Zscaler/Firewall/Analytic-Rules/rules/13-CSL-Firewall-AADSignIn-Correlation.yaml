@@ -3,11 +3,14 @@ name: "Correlation: Firewall Allowed Traffic + Azure AD Sign-In from Same IP"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Correlates firewall-allowed outbound traffic with Azure AD sign-in events sharing the same
-  external IP. An IP that appears in both AAD sign-in logs and firewall sessions simultaneously
-  may indicate a threat actor using the same infrastructure for credential-based cloud access
-  and network-level data collection. This correlation amplifies low-confidence signals from
-  each source into a high-confidence cross-vector indicator.
+  Correlates permitted firewall traffic with Azure AD sign-in events sharing the same
+  external IP. An IP that appears in both Entra sign-in logs and firewall sessions at
+  the same time may indicate a threat actor reusing the same infrastructure for
+  credential-based cloud access and network-level collection. The correlation turns
+  two low-confidence signals into one high-confidence cross-vector indicator.
+  Two corrections were required. ResultType is a string column in SigninLogs, so the
+  previous integer comparison never matched and the join was always empty. Both
+  sides of the join are now lower-cased before comparison.
   MITRE ATT&CK: T1078 (Valid Accounts)
 severity: High
 requiredDataConnectors:
@@ -17,7 +20,7 @@ requiredDataConnectors:
   - connectorId: AzureActiveDirectory
     dataTypes:
       - SigninLogs
-queryFrequency: 1h
+queryFrequency: 1d
 queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
@@ -31,17 +34,23 @@ query: |
       CommonSecurityLog
       | where TimeGenerated > ago(1d)
       | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-      | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+      | where isnotempty(DestinationIP)
       | where ipv4_is_private(DestinationIP) == false
       | summarize
           FW_Connections = count(),
           FW_Sources     = make_set(SourceIP, 10),
           FW_BytesSent   = sum(SentBytes),
           FW_Vendors     = make_set(DeviceVendor)
-        by ExternalIP = DestinationIP;
+        by ExternalIP = tolower(tostring(DestinationIP));
   SigninLogs
   | where TimeGenerated > ago(1d)
-  | where ResultType == 0
+  // ResultType is a string column; the previous integer comparison never matched,
+  // which meant the join was always empty and the rule could never fire.
+  | where tostring(ResultType) == "0"
   | where isnotempty(IPAddress)
   | summarize
       AAD_SignInCount  = count(),
@@ -49,7 +58,7 @@ query: |
       AAD_AppNames     = make_set(AppDisplayName, 10),
       AAD_Countries    = make_set(Location, 5),
       AAD_RiskLevels   = make_set(RiskLevelDuringSignIn, 5)
-    by IPAddress
+    by IPAddress = tolower(tostring(IPAddress))
   | join kind=inner FirewallExternalIPs on $left.IPAddress == $right.ExternalIP
   | project
       IPAddress,

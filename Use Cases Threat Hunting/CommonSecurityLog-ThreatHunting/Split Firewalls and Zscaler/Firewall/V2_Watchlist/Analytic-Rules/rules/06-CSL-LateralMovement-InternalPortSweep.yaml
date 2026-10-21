@@ -5,15 +5,19 @@ kind: Scheduled
 description: |
   Detects an internal host connecting to more than 5 distinct internal targets on ports
   commonly used for lateral movement: SMB (445), RDP (3389), WinRM (5985/5986), SSH (22),
-  Telnet (23), RPC (135), NetBIOS (139), and common database ports. Fortinet and Palo Alto
-  inter-zone logs are primary sources for internal-to-internal traffic visibility.
+  Telnet (23), RPC (135), NetBIOS (139) and common database ports. Fortinet and Palo Alto
+  inter-zone logs are the primary source of internal-to-internal traffic visibility.
+  Two corrections were required for this rule to work at all. DestinationPort is a
+  string column in CommonSecurityLog, so the previous integer port list never matched
+  and the rule could not fire. The accepted-attempt counter now separates a sweep the
+  firewall permitted from one it denied.
   MITRE ATT&CK: T1021 (Remote Services), T1570 (Lateral Tool Transfer)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
+queryFrequency: 6h
 queryPeriod: 6h
 triggerOperator: gt
 triggerThreshold: 0
@@ -23,20 +27,29 @@ relevantTechniques:
   - T1021
   - T1570
 query: |
-  let LateralPorts = dynamic([22, 23, 135, 139, 445, 3389, 5985, 5986, 1433, 3306, 5432]);
+  // DestinationPort is a STRING column in CommonSecurityLog. The previous
+  // integer list never matched, so this rule could not fire at all.
+  let LateralPorts = dynamic([
+      "22", "23", "135", "139", "445", "3389", "5985", "5986",
+      "1433", "1434", "3306", "5432", "1521", "8080"]);
   CommonSecurityLog
   | where TimeGenerated > ago(6h)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks")
+  | where isnotempty(SourceIP) and isnotempty(DestinationIP)
   | where ipv4_is_private(SourceIP) == true
   | where ipv4_is_private(DestinationIP) == true
-  | where DestinationPort in (LateralPorts)
+  | where SourceIP != DestinationIP
+  | extend DstPort = tostring(DestinationPort)
+  | where DstPort in (LateralPorts)
   | summarize
       UniqueTargets   = dcount(DestinationIP),
-      UniquePorts     = dcount(DestinationPort),
+      UniquePorts     = dcount(DstPort),
       TotalAttempts   = count(),
+      AcceptedAttempts = countif(tolower(DeviceAction) in ("accept", "allowed", "allow")),
       TargetIPs       = make_set(DestinationIP, 30),
-      PortsUsed       = make_set(DestinationPort, 10),
+      PortsUsed       = make_set(DstPort, 10),
       Actions         = make_set(DeviceAction, 5),
+      Users           = make_set(SourceUserName, 10),
       FirstSeen       = min(TimeGenerated),
       LastSeen        = max(TimeGenerated)
     by SourceIP, DeviceVendor
@@ -51,6 +64,7 @@ customDetails:
   UniqueTargets: UniqueTargets
   UniquePorts: UniquePorts
   TotalAttempts: TotalAttempts
+  AcceptedAttempts: AcceptedAttempts
 alertDetailsOverride:
   alertDisplayNameFormat: "Lateral Movement - {{SourceIP}} swept {{UniqueTargets}} internal hosts"
   alertDescriptionFormat: "Host {{SourceIP}} connected to {{UniqueTargets}} internal targets on {{UniquePorts}} admin/pivot ports. Possible lateral movement or reconnaissance."

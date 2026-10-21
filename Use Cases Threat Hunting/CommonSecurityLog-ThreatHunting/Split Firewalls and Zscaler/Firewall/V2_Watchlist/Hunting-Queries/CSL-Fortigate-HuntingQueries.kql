@@ -1,0 +1,772 @@
+// =============================================================================
+// CommonSecurityLog - FortiGate FortiOS Threat Hunting Queries
+// Vendor:     Fortinet FortiGate
+// Table:      CommonSecurityLog
+// Focus:      FortiGate-specific log types, UTM enforcement, VPN, admin, DNS, DLP
+// Queries:    16 (FQ01 - FQ16)
+// =============================================================================
+//
+// HOW TO USE THIS PACK
+// --------------------
+// FQ01 first. It is a coverage census: it shows which FortiGate log categories
+// are actually arriving in the workspace and how many of each. Every other
+// query in this pack depends on a log type being present, and a FortiGate that
+// is only forwarding "traffic" logs will silently return nothing for the UTM,
+// VPN, admin and DNS queries. Run FQ01 first and confirm coverage before
+// drawing conclusions from silence.
+//
+// FORTIGATE FIELD REFERENCE (as landed in CommonSecurityLog via CEF/AMA)
+// ---------------------------------------------------------------------
+//   DeviceVendor        "Fortinet"
+//   DeviceProduct       "FortiGate" or "FortiGate-<model>"
+//   DeviceVersion       FortiOS version
+//   DeviceEventClassID  log CATEGORY: traffic | utm | event | app-ctrl | dns |
+//                       webfilter | sslvpn | vpn | antivirus | dlp | waf
+//   DeviceEventID       FortiGate logid, e.g. 0000000013 traffic, 0001000011 utm
+//   Activity            log SUBTYPE: forward | local-in | ips | ips-packet | av |
+//                       antibot | webfilter | appctrl | dlp | admin | user | auth |
+//                       sslvpn | vpn | dns | forward-anomaly | ips-anomaly | fct-utm
+//   DeviceAction        accept | deny | close | timeout | client-rst | server-rst |
+//                       unresolved | blocked
+//                       "blocked" is what FortiGate reports when a UTM control
+//                       enforced. "accept" means the control only DETECTED.
+//   LogSeverity         high | medium | low
+//   SourceIP/DestinationIP/SourcePort/DestinationPort
+//                       DestinationPort is a STRING column
+//   SourceUserName      the user, usually DOMAIN\user or user@domain
+//   RequestURL          full URL, not a hostname
+//   DestinationHostName hostname when the log carries one
+//   ApplicationProtocol FortiGate "app", e.g. HTTPS, DNS, HTTP, YouTube
+//   Protocol            TCP | UDP | ICMP (transport protocol, never HTTP)
+//   SentBytes/ReceivedBytes
+//   DeviceCustomString1 CEF cs1 - IPS signature name on many ingestion paths
+//   AdditionalExtensions raw CEF extension string, e.g. catdesc=... app=...
+//   Message             the full CEF message
+//
+// The category and the subtype can arrive in either DeviceEventClassID or
+// Activity depending on the ingestion path, so the type filters below test
+// both. Confirm which fields your connector populates before relying on any
+// single one.
+//
+// SOURCEUSERNAME IS OFTEN EMPTY ON FAILED LOGONS
+// ----------------------------------------------
+// The connector maps the CEF suser field to SourceUserName. FortiGate does not
+// populate suser on failed authentication; it writes the user into the
+// free-text key-value tail of the log instead (user="jsmith"). The result is
+// that SourceUserName is blank for exactly the events an auth-failure hunt
+// depends on, and a query that groups by SourceUserName silently reports
+// nothing. Two consequences:
+//
+//   1. Any query in this pack that summarizes Users = make_set(SourceUserName)
+//      under-reports on authentication events. FQ04 and FQ16 are affected;
+//      FQ16 recovers the name from the raw payload, FQ04 does not yet.
+//   2. An empty username column is not proof of no activity. It is a signal
+//      to check the ingestion path, not the perimeter.
+//
+// FQ16 carries the recovery logic (regex over AdditionalExtensions/Message,
+// with SourceUserName preferred when populated). If FQ16 returns rows with an
+// empty UserName, the gateway is not emitting user= at all and the fix is on
+// the FortiGate logging filter, not in KQL.
+//
+// A durable fix is a DCR outputStream transform that promotes the extracted
+// user into a first-class column, so downstream rules stop regexing the raw
+// message at query time.
+// =============================================================================
+
+
+// =============================================================================
+// FQ01 - FortiGate Log Coverage Census
+// MITRE Techniques: -
+// Tactics        : -
+// Description    : Shows which FortiGate log categories and subtypes are actually
+//                  arriving in the workspace, with volume and the newest event per
+//                  category. Run this first. A FortiGate that forwards only
+//                  "traffic" logs will return nothing for every UTM, VPN, admin,
+//                  DNS and DLP query in this pack, and that silence looks exactly
+//                  like a clean perimeter.
+// =============================================================================
+let lookback = 24h;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| extend Category = tolower(tostring(DeviceEventClassID))
+| extend Subtype  = tolower(tostring(Activity))
+| extend LogType   = iff(isempty(Category), "unknown", Category)
+| summarize
+    EventCount   = count(),
+    Subtypes     = make_set(Subtype, 10),
+    Actions      = make_set(DeviceAction, 5),
+    Severities   = make_set(LogSeverity, 5),
+    Sources      = dcount(SourceIP),
+    NewestEvent  = max(TimeGenerated),
+    OldestEvent  = min(TimeGenerated)
+  by LogType
+| extend AgeHours = round(datetime_diff("hour", OldestEvent, NewestEvent), 1)
+| order by EventCount desc
+
+
+// =============================================================================
+// FQ02 - FortiGate UTM and IPS Signature Leaderboard
+// MITRE Techniques: T1190, T1105
+// Tactics        : InitialAccess, Execution
+// Description    : Top FortiGate UTM signatures by volume, with the sources that
+//                  triggered them and the enforcement split. The signature name
+//                  comes from DeviceCustomString1 where the connector populates it
+//                  and is otherwise recovered from catdesc in AdditionalExtensions.
+//                  A signature that is firing constantly is either a real
+//                  campaign or a detection that is mis-tuned and has trained the
+//                  analysts to ignore it.
+// =============================================================================
+let lookback = 24h;
+let minHits = 1;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceEventClassID) in ("utm", "antivirus", "webfilter", "app-ctrl")
+    or tolower(Activity) in ("ips", "ips-packet", "av", "antibot", "file-block",
+                             "appctrl", "webfilter", "fct-utm", "ips-anomaly",
+                             "av-anomaly")
+| extend IPSSignature = iff(isnotempty(DeviceCustomString1),
+                            tostring(DeviceCustomString1),
+                            extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions)))
+| extend IPSSignature = iff(isempty(IPSSignature), tostring(Activity), IPSSignature)
+| summarize
+    HitCount        = count(),
+    BlockedCount    = countif(tolower(DeviceAction) == "blocked"),
+    DetectedCount   = countif(tolower(DeviceAction) == "accept"),
+    SourceIPs       = make_set(SourceIP, 20),
+    DestHostNames   = make_set(DestinationHostName, 10),
+    RequestURLs     = make_set(RequestURL, 10),
+    Severities      = make_set(LogSeverity, 5),
+    Apps            = make_set(ApplicationProtocol, 5),
+    FirstSeen       = min(TimeGenerated),
+    LastSeen        = max(TimeGenerated)
+  by IPSSignature
+| where HitCount > minHits
+| extend Enforcement = iff(BlockedCount == 0, "Detected but NOT blocked",
+                      iff(DetectedCount == 0, "Blocked", "Mixed"))
+| order by HitCount desc
+
+
+// =============================================================================
+// FQ03 - FortiGate UTM Detected But Not Enforced
+// MITRE Techniques: T1562.001
+// Tactics        : DefenseEvasion
+// Description    : FortiGate UTM events where the gateway DETECTED the traffic
+//                  but did not block it. FortiGate reports act=blocked when a
+//                  control enforces and act=accept when it only observes, so
+//                  these are the events where a security control was configured
+//                  and did not do its job. This is the highest-value FortiGate
+//                  hunt in the pack and is usually a configuration finding
+//                  rather than an attack.
+// =============================================================================
+let lookback = 24h;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceAction) == "accept"
+| where tolower(DeviceEventClassID) in ("utm", "antivirus", "webfilter", "app-ctrl")
+    or tolower(Activity) in ("ips", "ips-packet", "av", "antibot", "file-block",
+                             "appctrl", "webfilter", "fct-utm")
+| extend IPSSignature = iff(isnotempty(DeviceCustomString1),
+                            tostring(DeviceCustomString1),
+                            extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions)))
+| extend IPSSignature = iff(isempty(IPSSignature), tostring(Activity), IPSSignature)
+| summarize
+    DetectedCount  = count(),
+    SourceIPs      = make_set(SourceIP, 20),
+    Users          = make_set(SourceUserName, 10),
+    DestHostNames  = make_set(DestinationHostName, 10),
+    RequestURLs    = make_set(RequestURL, 10),
+    Severities     = make_set(LogSeverity, 5),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by IPSSignature
+| order by DetectedCount desc
+
+
+// =============================================================================
+// FQ04 - FortiGate SSL-VPN and Admin Successful Logons
+// MITRE Techniques: T1078, T1078.002
+// Tactics        : InitialAccess, DefenseEvasion
+// Description    : Successful authentication against FortiGate admin, local user and
+//                  SSL-VPN services, with the country of the source address.
+//                  Successful logons to the management plane are the ones that
+//                  matter: an admin console session is full control of the
+//                  perimeter. The country code is the fastest way to spot a
+//                  login from an unexpected geography.
+// =============================================================================
+let lookback = 7d;
+let authEventIDs = dynamic([
+    "0101000003",  // admin console login success
+    "0101000013",  // admin login success
+    "0102000012",  // local user login success
+    "0101001013",  // SSL-VPN tunnel up
+    "0101001057"]);// SSL-VPN login
+let authSubtypes = dynamic([
+    "admin", "admin-login", "login", "user", "auth", "sslvpn", "ssl-vpn",
+    "vpn", "vpn-login", "authenticate"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| extend EventID  = tolower(tostring(DeviceEventID))
+| extend Subtype  = tolower(tostring(Activity))
+| extend Outcome  = tolower(tostring(EventOutcome))
+| extend Action   = tolower(tostring(DeviceAction))
+| where EventID in (authEventIDs) or Subtype in (authSubtypes)
+| where Outcome has "success" or Action in ("accept", "allowed", "allow")
+| extend SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| summarize
+    SuccessCount  = count(),
+    Users         = make_set(SourceUserName, 20),
+    SourceIPs     = make_set(SourceIP, 20),
+    SrcCountries  = make_set(SrcCountry, 5),
+    Subtypes      = make_set(Activity, 10),
+    FirstSeen     = min(TimeGenerated),
+    LastSeen      = max(TimeGenerated)
+  by SrcCountry, Action
+| order by SuccessCount desc
+
+
+// =============================================================================
+// FQ05 - FortiGate SSL-VPN Tunnel Sessions
+// MITRE Techniques: T1078, T1048
+// Tactics        : InitialAccess, Exfiltration
+// Description    : Long-lived FortiGate SSL-VPN tunnels with the data volume that
+//                  moved through each. A remote session that pushed gigabytes out
+//                  of the estate, or that stayed up for days, is either a heavy
+//                  legitimate user or a staging channel. The bytes and duration
+//                  are read from AdditionalExtensions because FortiGate reports
+//                  them as CEF extension keys rather than mapped columns.
+// =============================================================================
+let lookback = 7d;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(Activity) in ("sslvpn", "ssl-vpn", "vpn", "vpn-login")
+    or tolower(DeviceEventID) in ("0101001013", "0101001014", "0101001057", "0101001058")
+| extend SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| extend SentBytes  = tolong(replace_string(tostring(SentBytes), ",", ""))
+| extend Duration   = extract(@"duration=([^ ]+)", 1, tostring(AdditionalExtensions))
+| summarize
+    SessionCount   = count(),
+    Users          = make_set(SourceUserName, 20),
+    SourceIPs      = make_set(SourceIP, 20),
+    SrcCountries   = make_set(SrcCountry, 5),
+    TotalBytes     = sum(SentBytes),
+    DestIPs        = make_set(DestinationIP, 20),
+    DestHostNames  = make_set(DestinationHostName, 10),
+    Durations      = make_set(Duration, 5),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by SrcCountry
+| extend TotalMB = round(toreal(TotalBytes) / 1048576.0, 2)
+| order by TotalMB desc
+
+
+// =============================================================================
+// FQ06 - FortiGate Administrative Activity
+// MITRE Techniques: T1098, T1078
+// Tactics        : Persistence, InitialAccess
+// Description    : FortiGate administrative events - admin logins, configuration
+//                  changes, account and policy changes. An attacker who reaches
+//                  the admin console does not have to attack the estate; they
+//                  change the estate. This hunt is the audit trail for who
+//                  changed the firewall and from where.
+// =============================================================================
+let lookback = 7d;
+let adminSubtypes = dynamic([
+    "admin", "admin-login", "config", "admin-config", "system", "user",
+    "certificate", "fortiguard", "update", "device", "ha", "nat", "ipsec",
+    "ppp", "wireless", "dhcp", "fortiweb", "vpn"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceEventClassID) == "event" or tolower(Activity) in (adminSubtypes)
+| extend SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| summarize
+    EventCount    = count(),
+    AdminUsers    = make_set(SourceUserName, 20),
+    SourceIPs     = make_set(SourceIP, 20),
+    SrcCountries  = make_set(SrcCountry, 5),
+    Subtypes      = make_set(Activity, 20),
+    Actions       = make_set(DeviceAction, 5),
+    Severities    = make_set(LogSeverity, 5),
+    FirstSeen     = min(TimeGenerated),
+    LastSeen      = max(TimeGenerated)
+  by Activity
+| order by EventCount desc
+
+
+// =============================================================================
+// FQ07 - FortiGate Web Filter Category Breakdown
+// MITRE Techniques: T1566.002, T1071.001
+// Tactics        : InitialAccess, CommandAndControl
+// Description    : What the FortiGate web filter is seeing and deciding, split by
+//                  category and action. The permitted categories are the
+//                  interesting column: a category that should be blocked but is
+//                  being allowed is a control gap, and a category that is
+//                  constantly allowed to a large volume of traffic is either
+//                  shadow IT or a misconfiguration.
+// =============================================================================
+let lookback = 7d;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceEventClassID) == "webfilter" or tolower(Activity) == "webfilter"
+| extend WebCategory = extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions))
+| extend WebCategory = iff(isempty(WebCategory), "unclassified", WebCategory)
+| extend Action      = tolower(tostring(DeviceAction))
+| summarize
+    HitCount       = count(),
+    BlockedCount   = countif(Action == "blocked"),
+    AllowedCount   = countif(Action == "accept"),
+    Users          = make_set(SourceUserName, 20),
+    SourceIPs      = make_set(SourceIP, 20),
+    DestHostNames  = make_set(DestinationHostName, 10),
+    RequestURLs    = make_set(RequestURL, 10),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by WebCategory
+| extend BlockRate = iff(HitCount > 0, round(100.0 * toreal(BlockedCount) / toreal(HitCount), 1), 0.0)
+| order by HitCount desc
+
+
+// =============================================================================
+// FQ08 - FortiGate DNS Telemetry and Tunneling Indicators
+// MITRE Techniques: T1071.004
+// Tactics        : CommandAndControl
+// Description    : FortiGate DNS query telemetry: volume per internal host, the
+//                  share of responses that did not resolve, and the length of the
+//                  queried name. Long names with a high NXDOMAIN rate are the
+//                  classic DNS tunnelling shape, where data is encoded into
+//                  subdomains to smuggle it out. FortiGate only carries the
+//                  queried name and the response code, so the entropy signal
+//                  here is length and repetition, not character distribution.
+// =============================================================================
+let lookback = 24h;
+let minQueries = 500;
+let longNameChars = 40;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceEventClassID) == "dns" or tolower(Activity) == "dns"
+| extend QueriedName = tostring(DestinationHostName)
+| extend QueriedName = iff(isempty(QueriedName),
+                           extract(@"hostname=([^ ]+)", 1, tostring(AdditionalExtensions)),
+                           QueriedName)
+| extend ResponseCode = extract(@"rcode=([^ ]+)", 1, tostring(AdditionalExtensions))
+| extend NameLength  = strlen(QueriedName)
+| summarize
+    QueryCount      = count(),
+    UniqueNames     = dcount(QueriedName),
+    MaxNameLength   = max(NameLength),
+    LongNameCount   = countif(NameLength > longNameChars),
+    NXDOMAINCount   = countif(ResponseCode has_any ("3", "NXDOMAIN")),
+    SourceIPs       = make_set(SourceIP, 20),
+    SampleNames     = make_set(QueriedName, 10),
+    FirstSeen       = min(TimeGenerated),
+    LastSeen        = max(TimeGenerated)
+  by SourceIP
+| where QueryCount > minQueries
+| extend NXDOMAINRatio = iff(QueryCount > 0, round(100.0 * toreal(NXDOMAINCount) / toreal(QueryCount), 1), 0.0)
+| extend LongNameRatio = iff(QueryCount > 0, round(100.0 * toreal(LongNameCount) / toreal(QueryCount), 1), 0.0)
+| order by QueryCount desc
+
+
+// =============================================================================
+// FQ09 - FortiGate Policy Hit Analysis
+// MITRE Techniques: T1562
+// Tactics        : DefenseEvasion
+// Description    : Which FortiGate policies are carrying traffic, how much, and
+//                  which are carrying none. An unused policy is attack surface
+//                  that is maintained but never exercised, and a policy carrying
+//                  an unexpected volume of denied traffic is often the policy
+//                  an attacker is testing. The policy id is read from the
+//                  policyid key in AdditionalExtensions.
+// =============================================================================
+let lookback = 7d;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| extend PolicyId = extract(@"policyid=([^ ]+)", 1, tostring(AdditionalExtensions))
+| extend Action   = tolower(tostring(DeviceAction))
+| summarize
+    TotalEvents   = count(),
+    AcceptedCount = countif(Action in ("accept", "allowed", "allow")),
+    DeniedCount   = countif(Action in ("deny", "drop", "blocked", "reject")),
+    SourceIPs     = dcount(SourceIP),
+    DestIPs       = dcount(DestinationIP),
+    Apps          = make_set(ApplicationProtocol, 5),
+    FirstSeen     = min(TimeGenerated),
+    LastSeen      = max(TimeGenerated)
+  by PolicyId
+| order by TotalEvents desc
+
+
+// =============================================================================
+// FQ10 - FortiGate Traffic Anomaly and Denial of Service Events
+// MITRE Techniques: T1498, T1499
+// Tactics        : Impact
+// Description    : FortiGate traffic anomaly, IPS anomaly and botnet events, which
+//                  are the gateway's own view of a flood, a scan storm or a
+//                  compromised host talking to known bad infrastructure. These
+//                  subtypes are FortiGate specific and are not visible as IPS
+//                  signature hits, so a rule that only looks at signatures misses
+//                  them entirely.
+// =============================================================================
+let lookback = 24h;
+let anomalySubtypes = dynamic(["forward-anomaly", "ips-anomaly", "av-anomaly",
+                                "botnet", "dos", "flood", "anomaly", "tcp-psh",
+                                "udp-flood", "icmp-flood"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(Activity) in (anomalySubtypes)
+    or tolower(DeviceEventClassID) in ("traffic-anomaly", "anomaly")
+| extend SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| summarize
+    EventCount    = count(),
+    SourceIPs     = make_set(SourceIP, 20),
+    DestIPs       = make_set(DestinationIP, 20),
+    SrcCountries  = make_set(SrcCountry, 5),
+    Actions       = make_set(DeviceAction, 5),
+    Severities    = make_set(LogSeverity, 5),
+    FirstSeen     = min(TimeGenerated),
+    LastSeen      = max(TimeGenerated)
+  by Activity, SrcCountry
+| order by EventCount desc
+
+
+// =============================================================================
+// FQ11 - FortiGate DLP Sensitive Data Matches
+// MITRE Techniques: T1041
+// Tactics        : Exfiltration
+// Description    : FortiGate DLP events where a sensitive data pattern matched
+//                  traffic. The DLP subsystem inspects content on the wire, so a
+//                  match means the data actually crossed the boundary, whether
+//                  the policy allowed it. The matched pattern is read from
+//                  catdesc in AdditionalExtensions.
+// =============================================================================
+let lookback = 7d;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(Activity) == "dlp" or tolower(DeviceEventClassID) == "dlp"
+| extend DLPPattern = extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions))
+| extend DLPPattern = iff(isempty(DLPPattern), "unclassified", DLPPattern)
+| extend Action     = tolower(tostring(DeviceAction))
+| summarize
+    HitCount       = count(),
+    BlockedCount   = countif(Action == "blocked"),
+    AllowedCount   = countif(Action == "accept"),
+    Users          = make_set(SourceUserName, 20),
+    SourceIPs      = make_set(SourceIP, 20),
+    DestHostNames  = make_set(DestinationHostName, 10),
+    Apps           = make_set(ApplicationProtocol, 5),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by DLPPattern
+| extend BlockRate = iff(HitCount > 0, round(100.0 * toreal(BlockedCount) / toreal(HitCount), 1), 0.0)
+| order by HitCount desc
+
+
+// =============================================================================
+// FQ12 - FortiGate Application Control - Risk Categories
+// MITRE Techniques: T1048, T1090
+// Tactics        : Exfiltration, CommandAndControl
+// Description    : FortiGate application control events grouped by the application
+//                  that was identified, showing which risky categories the
+//                  estate is actually using. Peer to peer, torrent, anonymiser and
+//                  personal cloud storage categories are the ones that break both
+//                  exfiltration and security controls at the same time.
+// =============================================================================
+let lookback = 7d;
+let riskApps = dynamic(["bittorrent", "torrent", "p2p", "anonymizer", "anonymiser",
+                         "proxy", "socks", "tor", "personal.cloud", "dropbox",
+                         "onedrive", "mega", "telegram", "whatsapp", "discord",
+                         "steam", "skype", "facebook", "youtube", "spotify"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceEventClassID) == "app-ctrl" or tolower(Activity) == "appctrl"
+| extend DetectedApp = tolower(tostring(ApplicationProtocol))
+| extend Action      = tolower(tostring(DeviceAction))
+| summarize
+    HitCount       = count(),
+    BlockedCount   = countif(Action == "blocked"),
+    AllowedCount   = countif(Action == "accept"),
+    Users          = make_set(SourceUserName, 20),
+    SourceIPs      = make_set(SourceIP, 20),
+    DestHostNames  = make_set(DestinationHostName, 10),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by DetectedApp
+| where DetectedApp in (riskApps)
+| extend BlockRate = iff(HitCount > 0, round(100.0 * toreal(BlockedCount) / toreal(HitCount), 1), 0.0)
+| order by HitCount desc
+
+
+// =============================================================================
+// FQ13 - FortiGate Internal to Internal Traffic (Zone Pivoting)
+// MITRE Techniques: T1021, T1570
+// Tactics        : LateralMovement
+// Description    : Internal-to-internal sessions observed by the FortiGate, broken
+//                  down by port and source. This is the only place most estates
+//                  see east-west traffic at all, because endpoint telemetry does
+//                  not cross the firewall boundary. A host talking to many
+//                  internal targets on admin ports is the lateral movement
+//                  signal that the perimeter denies cannot see.
+// =============================================================================
+let lookback = 24h;
+let adminPorts = dynamic(["22", "23", "135", "139", "445", "3389", "5985", "5986",
+                           "1433", "3306", "5432", "1521"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
+| where ipv4_is_private(SourceIP) == true
+| where ipv4_is_private(DestinationIP) == true
+| where SourceIP != DestinationIP
+| extend DstPort = tostring(DestinationPort)
+| summarize
+    SessionCount     = count(),
+    UniqueTargets    = dcount(DestinationIP),
+    UniquePorts      = dcount(DstPort),
+    AdminPortHits    = countif(DstPort in (adminPorts)),
+    AcceptedSessions = countif(tolower(DeviceAction) in ("accept", "allowed", "allow")),
+    TargetIPs        = make_set(DestinationIP, 30),
+    PortsUsed        = make_set(DstPort, 10),
+    Users            = make_set(SourceUserName, 10),
+    FirstSeen        = min(TimeGenerated),
+    LastSeen         = max(TimeGenerated)
+  by SourceIP
+| where UniqueTargets > 5
+| order by UniqueTargets desc
+
+
+// =============================================================================
+// FQ14 - FortiGate FortiClient Endpoint Telemetry
+// MITRE Techniques: T1082
+// Tactics        : Discovery
+// Description    : FortiClient managed endpoint telemetry - the fct-traffic,
+//                  fct-utm and fct-event log types. This is the FortiGate side of
+//                  endpoint visibility and it is usually the only source that
+//                  survives an attacker disabling a security tool. An estate with
+//                  FortiClient deployed but no fct-* logs arriving has a blind
+//                  spot, and this query makes that visible.
+// =============================================================================
+let lookback = 7d;
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(Activity) has_any ("fct-")
+    or tolower(DeviceEventClassID) has_any ("fct-")
+    or tolower(DeviceEventID) has_any ("0100", "0110")
+| summarize
+    EventCount     = count(),
+    Endpoints      = dcount(SourceIP),
+    Users          = make_set(SourceUserName, 10),
+    Apps           = make_set(ApplicationProtocol, 5),
+    Actions        = make_set(DeviceAction, 5),
+    Severities     = make_set(LogSeverity, 5),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by Activity
+| order by EventCount desc
+
+
+// =============================================================================
+// FQ15 - FortiGate External Inbound Session Exposure
+// MITRE Techniques: T1190
+// Tactics        : InitialAccess
+// Description    : Internet-facing sessions the FortiGate permitted, grouped by
+//                  the internal host that was reached and the port it was reached
+//                  on. Anything here is a service that is exposed to the
+//                  internet. Management interfaces, databases and file shares
+//                  showing up in this list are findings in their own right,
+//                  independent of whether anyone has attacked them yet.
+// =============================================================================
+let lookback = 24h;
+let exposedServicePorts = dynamic(["22", "23", "135", "139", "445", "1433", "3306",
+                                    "5432", "3389", "5985", "5986", "8080", "8443",
+                                    "9200", "27017", "6379", "11211"]);
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| where tolower(DeviceAction) in ("accept", "allowed", "allow")
+| where isnotempty(SourceIP) and isnotempty(DestinationIP)
+| where ipv4_is_private(SourceIP) == false
+| where ipv4_is_private(DestinationIP) == true
+| extend DstPort = tostring(DestinationPort)
+| extend SrcCountry = tostring(geo_info_from_ip_address(SourceIP).country_2)
+| summarize
+    SessionCount    = count(),
+    ExternalSources = dcount(SourceIP),
+    SrcCountries    = make_set(SrcCountry, 5),
+    SourceIPs       = make_set(SourceIP, 20),
+    Users           = make_set(SourceUserName, 10),
+    Apps            = make_set(ApplicationProtocol, 5),
+    FirstSeen       = min(TimeGenerated),
+    LastSeen        = max(TimeGenerated)
+  by DestinationIP, DstPort
+| where DstPort in (exposedServicePorts)
+| order by SessionCount desc
+
+
+// =============================================================================
+// FQ16 - FortiGate SSL-VPN Auth Failures with Username Recovery
+// MITRE Techniques: T1110, T1078
+// Tactics        : CredentialAccess, InitialAccess
+// Description    : Failed SSL-VPN and admin authentication grouped by source IP,
+//                  with the username recovered from the raw log when the
+//                  connector left SourceUserName empty. FortiGate writes the
+//                  user into the free-text key-value tail of the log (user=...)
+//                  rather than the CEF suser field on failed logons, so
+//                  SourceUserName is blank for exactly the events that matter
+//                  most here. This query falls back to a regex over
+//                  AdditionalExtensions/Message so the user is visible today,
+//                  and the reason= field separates password guessing
+//                  (sslvpn_login_fail) from account enumeration
+//                  (sslvpn_login_unknown_user).
+//
+//                  If this query returns rows with an EMPTY UserName, the
+//                  gateway is not emitting user= at all and the fix is on the
+//                  FortiGate, not in KQL. See "USERNAME RECOVERY" below.
+// =============================================================================
+//
+// WHY THIS EXISTS
+// ---------------
+// Q17 in CSL-Firewall-HuntingQueries.kql is the cross-vendor brute force hunt
+// and it reports failures by SourceIP. FQ04 in this pack reports SUCCESSFUL
+// logons. Neither one joins the two, and neither recovers the username when
+// the connector drops it. This query does both jobs for FortiGate SSL-VPN
+// specifically, which is the service that is actually internet-facing.
+//
+// USERNAME RECOVERY
+// -----------------
+// FortiGate failed-login log lines look like this in the raw payload:
+//     logid="0101039426" type="event" subtype="vpn" level="alert"
+//     msg="SSL VPN login fail" user="jsmith" remip="203.0.113.7"
+//     reason="sslvpn_login_fail"
+// The connector maps suser to SourceUserName, and failed logons have no suser,
+// so SourceUserName stays blank. The user is still present in the payload.
+//
+// Run the probe below first to confirm which field carries it in YOUR
+// workspace, then use the main query. The probe is deliberately separate so
+// you can see the raw shape before trusting the regex.
+
+// -----------------------------------------------------------------------------
+// PROBE - run this first. Confirms whether user= is present at all.
+// -----------------------------------------------------------------------------
+// let authFailIDs = dynamic(["0101039426", "0101001058", "0101001057"]);
+// CommonSecurityLog
+// | where TimeGenerated > ago(24h)
+// | where DeviceVendor == "Fortinet"
+// | where DeviceEventID in (authFailIDs)
+//     or tolower(tostring(Activity)) has_any ("vpn", "sslvpn", "auth", "login")
+// | project TimeGenerated, DeviceEventID, SourceIP, SourceUserName,
+//           Activity, DeviceAction, EventOutcome,
+//           AdditionalExtensions, Message
+// | take 20
+//
+// Read the AdditionalExtensions / Message column. If you see user="x" the main
+// query will work. If you do not, fix logging on the FortiGate first:
+//     config log eventfilter
+//         set event enable
+//         set vpn enable
+//         set user enable
+//     end
+// and confirm event/vpn categories are in the log forwarding filter, not just
+// traffic. No KQL can recover a field the gateway never sent.
+
+// -----------------------------------------------------------------------------
+// MAIN QUERY
+// -----------------------------------------------------------------------------
+let lookback = 24h;
+
+// FortiGate logids for authentication outcomes. Failures and the tunnel/login
+// successes are both here so the same query can correlate them.
+let authFailIDs = dynamic([
+    "0101039426",  // SSL VPN login fail (current)
+    "0101001058",  // SSL-VPN login failed (classic)
+    "0101001012",  // admin login failed
+    "0102000011",  // local user login failed
+    "0101001013"]);// SSL-VPN tunnel up (success, for the correlation below)
+let authFailSubtypes = dynamic([
+    "sslvpn", "ssl-vpn", "vpn", "vpn-login", "auth", "login", "loginfailed",
+    "admin", "admin-login", "user", "authenticate"]);
+
+CommonSecurityLog
+| where TimeGenerated > ago(lookback)
+| where DeviceVendor == "Fortinet"
+| extend EventID  = tolower(tostring(DeviceEventID))
+| extend Subtype  = tolower(tostring(Activity))
+| extend Category = tolower(tostring(DeviceEventClassID))
+| extend Outcome  = tolower(tostring(EventOutcome))
+| extend Action   = tolower(tostring(DeviceAction))
+| where EventID in (authFailIDs)
+    or Subtype in (authFailSubtypes)
+    or (Category == "event" and isnotempty(SourceIP))
+
+// The raw payload is the fallback source for the username and the reason.
+// AdditionalExtensions is the CEF extension tail; Message is the full line.
+// Concatenate both so the regex works regardless of ingestion path.
+| extend RawText = strcat(
+      tostring(AdditionalExtensions), " ", tostring(Message))
+
+// user="jsmith"  |  user='jsmith'  |  user=jsmith
+| extend UserFromRaw = extract(@'user="?([^"\s,]+)', 1, RawText)
+// reason="sslvpn_login_fail" tells guessing apart from enumeration
+| extend Reason      = extract(@'reason="?([^"\s,]+)', 1, RawText)
+// remip= is the real client address on some paths; SourceIP is usually set
+| extend RemIpRaw    = extract(@'remip="?([^"\s,]+)', 1, RawText)
+
+// Prefer the connector field when it is populated, otherwise fall back to raw.
+| extend UserName = iff(
+      isnotempty(tostring(SourceUserName)),
+      tostring(SourceUserName),
+      UserFromRaw)
+| extend ClientIP = iff(
+      isnotempty(tostring(SourceIP)),
+      tostring(SourceIP),
+      RemIpRaw)
+
+// Split success from failure. Everything after this is failure-focused, but
+// SuccessCount is carried per source IP so the correlation column works.
+| extend IsSuccess = (Outcome has "success"
+                      or Action in ("accept", "allowed", "allow"))
+| where IsSuccess == false
+| where Outcome has "fail"
+    or Action in ("deny", "reject", "failed", "failure")
+    or isnotempty(Reason)
+
+| summarize
+    FailureCount   = count(),
+    UniqueUsers    = dcount(UserName),
+    UserList       = make_set(UserName, 20),
+    Reasons        = make_set(Reason, 10),
+    Subtypes       = make_set(Activity, 10),
+    EventIDs       = make_set(DeviceEventID, 10),
+    Destinations   = make_set(DestinationIP, 5),
+    FirstSeen      = min(TimeGenerated),
+    LastSeen       = max(TimeGenerated)
+  by ClientIP
+
+// Auth failure volume worth a look. Raise or lower per environment.
+| where FailureCount > 5
+
+// SprayPattern: one IP failing against 3+ distinct accounts is credential
+// stuffing / password spray. UniqueUsers == 1 with a high count is a single
+// account being brute forced. The two need different responses.
+| extend SprayPattern = UniqueUsers >= 3
+| extend Pattern      = case(
+      UniqueUsers >= 3, "PasswordSpray",
+      UniqueUsers == 1, "SingleAccountBruteForce",
+      "MultiAccountBruteForce")
+
+// How many of the recovered names are actually populated, so a silent
+// connector regression is visible in the result rather than hidden.
+| extend UsersRecovered = array_length(make_set(UserName, 20))
+| order by FailureCount desc
+

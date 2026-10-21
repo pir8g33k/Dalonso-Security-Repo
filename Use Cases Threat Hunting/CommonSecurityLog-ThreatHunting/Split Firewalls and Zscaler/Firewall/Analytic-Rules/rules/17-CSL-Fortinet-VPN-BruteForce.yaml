@@ -1,65 +1,111 @@
 id: e7f8a9b0-c1d2-4e3f-4a5b-6c7d8e9f0a1b
-name: "Fortinet SSL-VPN and Admin Authentication Brute Force"
-version: 1.0.0
+name: "Fortinet FortiGate - Authentication Brute Force and Credential Stuffing"
+version: 1.1.0
 kind: Scheduled
 description: |
-  Detects repeated Fortinet SSL-VPN or administrative console authentication failures from a
-  single source IP (>5 failures). VPN infrastructure is a primary target for credential
-  stuffing and password spraying attacks since successful access provides direct network-level
-  entry. High failure counts from a single IP are strong indicators of automated brute force
-  or credential stuffing activity.
-  MITRE ATT&CK: T1110 (Brute Force)
+  Detects failed authentication events against FortiGate administrative, local user and SSL-VPN
+  services, grouped by the source address that generated them. VPN and admin interfaces are a
+  primary target for credential stuffing and password spraying because a single success hands
+  the attacker network-level entry, so repeated failures from one source are worth escalating
+  even when the account names vary.
+  The previous version of this rule matched on DeviceAction containing "failed", "denied",
+  "reject" or "failure". FortiGate uses those verbs for ordinary policy denials as well, so
+  every UTM block and every policy deny in the estate was being counted as an authentication
+  failure. The rule now requires the event to be an authentication event first, and then to
+  have failed, using the FortiGate event log id, the log subtype and EventOutcome together.
+  SprayPattern marks a source that failed against several distinct account names, which is
+  credential stuffing rather than a single account being brute forced.
+  The FortiOS event ids below cover the documented authentication log ids. Confirm them
+  against the FortiOS version in your estate, because they are not guaranteed to be identical
+  across releases.
+  MITRE ATT&CK: T1110 (Brute Force), T1110.003 (Password Spraying), T1110.004 (Credential Stuffing)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
-queryPeriod: 1d
+queryFrequency: 15m
+queryPeriod: 15m
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
   - CredentialAccess
 relevantTechniques:
   - T1110
+  - T1110.003
 query: |
+  let lookback = 15m;
+  let minFailures = 5;
+  let minDistinctUsers = 3;
+  // FortiGate event log ids for authentication activity. Confirm per FortiOS version.
+  let authEventIDs = dynamic([
+      "0101000002",  // admin console login failed
+      "0101000012",  // admin console login failed (alternate)
+      "0102000002",  // local user login failed
+      "0101001013",  // SSL-VPN tunnel up
+      "0101001057",  // SSL-VPN login
+      "0101001058"]);// SSL-VPN login failed
+  // FortiGate log subtypes that represent authentication activity.
+  let authSubtypes = dynamic([
+      "admin", "admin-login", "login", "loginfailed", "user", "auth",
+      "sslvpn", "ssl-vpn", "vpn", "vpn-login", "authenticate"]);
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor == "Fortinet"
-  | where DeviceEventClassID has_any ("32001", "32002", "39424", "39952")
-      or Activity has_any ("ssl-vpn-tunnel", "vpn", "admin-login", "loginfailed",
-                           "login failure", "authentication failed")
-      or DeviceAction has_any ("failed", "denied", "reject", "failure")
+  | extend EventID    = tolower(tostring(DeviceEventID))
+  | extend Subtype    = tolower(tostring(Activity))
+  | extend Category   = tolower(tostring(DeviceEventClassID))
+  | extend Outcome    = tolower(tostring(EventOutcome))
+  | extend Action     = tolower(tostring(DeviceAction))
+  // An authentication event: recognised event id, recognised subtype, or an
+  // "event" category log that carries a user identity.
+  | where EventID in (authEventIDs)
+      or Subtype in (authSubtypes)
+      or (Category == "event" and isnotempty(SourceUserName))
+  // ...that also failed. The previous rule treated any deny as an auth failure.
+  | where Outcome has "fail"
+      or Action in ("deny", "reject", "failed", "failure")
   | summarize
-      FailureCount     = count(),
-      UniqueUsers      = dcount(SourceUserName),
-      UserList         = make_set(SourceUserName, 20),
-      DestinationIPs   = make_set(DestinationIP, 5),
-      SourcePorts      = make_set(SourcePort, 5),
-      FirstSeen        = min(TimeGenerated),
-      LastSeen         = max(TimeGenerated)
-    by SourceIP, DeviceEventClassID
-  | where FailureCount > 5
+      FailureCount      = count(),
+      UniqueUsers       = dcount(SourceUserName),
+      UserList          = make_set(SourceUserName, 20),
+      RepresentativeUser = any(SourceUserName),
+      EventIDs          = make_set(DeviceEventID, 10),
+      Subtypes          = make_set(Activity, 10),
+      TargetPorts       = make_set(DestinationPort, 5),
+      FirstSeen         = min(TimeGenerated),
+      LastSeen          = max(TimeGenerated)
+    by SourceIP
+  | where FailureCount > minFailures
+  | extend SprayPattern = UniqueUsers >= minDistinctUsers
   | order by FailureCount desc
 entityMappings:
   - entityType: IP
     fieldMappings:
       - identifier: Address
         columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: RepresentativeUser
 customDetails:
   FailureCount: FailureCount
   UniqueUsers: UniqueUsers
+  SprayPattern: SprayPattern
+  Subtypes: Subtypes
+  EventIDs: EventIDs
 alertDetailsOverride:
-  alertDisplayNameFormat: "Fortinet VPN Brute Force - {{SourceIP}} ({{FailureCount}} failures)"
-  alertDescriptionFormat: "Source {{SourceIP}} generated {{FailureCount}} Fortinet authentication failures targeting {{UniqueUsers}} unique accounts. Possible VPN credential brute force attack."
+  alertDisplayNameFormat: "FortiGate Auth Brute Force - {{SourceIP}} ({{FailureCount}} failures, {{UniqueUsers}} users)"
+  alertDescriptionFormat: "Source {{SourceIP}} generated {{FailureCount}} failed FortiGate authentication events against {{UniqueUsers}} distinct accounts (log subtypes: {{Subtypes}}). Credential stuffing and password spraying target the VPN and admin interfaces because one success gives network entry. Check for a successful login from the same source."
 incidentConfiguration:
   createIncident: true
   groupingConfiguration:
     enabled: true
     reopenClosedIncident: false
-    lookbackDuration: PT6H
+    lookbackDuration: PT3H
     matchingMethod: Selected
     groupByEntities:
       - IP
     groupByAlertDetails: []
-    groupByCustomDetails: []
+    groupByCustomDetails:
+      - SprayPattern

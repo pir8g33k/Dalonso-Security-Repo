@@ -124,7 +124,7 @@ entityMappings:
         columnName: SourceIP
 customDetails:
   EvasionScore: EvasionScore
-  BaselineRequestsPerDay: BaselineRequestsPerDay
+  BaselineRPDay: BaselineRequestsPerDay
   TamperEvents: TamperEvents
   SvcEvents: SvcEvents
 alertDetailsOverride:

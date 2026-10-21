@@ -3,17 +3,22 @@ name: "Firewall Anomalous Outbound Data Volume - Exfiltration Risk"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects internal hosts sending more than 500 MB to external destinations in a 24-hour
-  period via Fortinet, Palo Alto, or Zscaler. Large outbound transfers that exceed typical
-  baseline volumes are a strong indicator of data exfiltration, particularly when combined
-  with unusual session counts or destination diversity.
-  MITRE ATT&CK: T1048 (Exfiltration Over Alternative Protocol)
+  Detects internal hosts sending large volumes of data to external destinations via
+  Fortinet, Palo Alto or Zscaler. Raw volume alone is a weak signal - a backup job or a
+  large software download looks identical - so the rule now also requires either
+  fan-out to many distinct external destinations, or a strongly skewed outbound to
+  inbound byte ratio, which is what staged exfiltration actually looks like.
+  Only permitted sessions are counted. FortiGate reports act=blocked for UTM blocks,
+  and the previous deny-list counted those as permitted.
+  The schedule runs once a day over a 24 hour window, so the same traffic does not
+  re-alert every hour.
+  MITRE ATT&CK: T1048 (Exfiltration Over Alternative Protocol), T1041 (Exfiltration Over C2 Channel)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
+queryFrequency: 1d
 queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
@@ -22,24 +27,40 @@ tactics:
 relevantTechniques:
   - T1048
 query: |
+  let lookback = 1d;
+  let minMB = 200.0;
+  let minDestIPs = 10;
+  let minOutboundRatio = 5.0;
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(SourceIP) and isnotempty(DestinationIP)
   | where ipv4_is_private(SourceIP) == true
   | where ipv4_is_private(DestinationIP) == false
+  | where not(ipv4_is_in_range(DestinationIP, "100.64.0.0/10"))
   | summarize
       TotalBytesSent    = sum(SentBytes),
       TotalBytesRecv    = sum(ReceivedBytes),
       SessionCount      = count(),
+      DestIPCount       = dcount(DestinationIP),
       DestIPs           = make_set(DestinationIP, 20),
       DestPorts         = make_set(DestinationPort, 10),
+      DestHostNames     = make_set(DestinationHostName, 10),
+      Users             = make_set(SourceUserName, 10),
       HourlyBuckets     = dcount(bin(TimeGenerated, 1h)),
       DeviceVendors     = make_set(DeviceVendor)
     by SourceIP
   | extend TotalMBSent = round(toreal(TotalBytesSent) / 1048576, 2)
-  | where TotalMBSent > 500
+  | extend TotalMBRecv = round(toreal(TotalBytesRecv) / 1048576, 2)
+  | extend OutboundRatio = iff(isnull(TotalMBRecv) or TotalMBRecv <= 0,
+                          0.0,
+                          round(TotalMBSent / TotalMBRecv, 2))
+  | where TotalMBSent > minMB
+       and (DestIPCount >= minDestIPs or OutboundRatio >= minOutboundRatio)
   | order by TotalMBSent desc
 entityMappings:
   - entityType: IP
@@ -50,6 +71,8 @@ customDetails:
   TotalMBSent: TotalMBSent
   SessionCount: SessionCount
   HourlyBuckets: HourlyBuckets
+  OutboundRatio: OutboundRatio
+  DestIPCount: DestIPCount
 alertDetailsOverride:
   alertDisplayNameFormat: "Data Exfiltration Risk - {{SourceIP}} sent {{TotalMBSent}} MB outbound"
   alertDescriptionFormat: "Host {{SourceIP}} transmitted {{TotalMBSent}} MB to external destinations across {{SessionCount}} sessions. Possible data exfiltration activity."

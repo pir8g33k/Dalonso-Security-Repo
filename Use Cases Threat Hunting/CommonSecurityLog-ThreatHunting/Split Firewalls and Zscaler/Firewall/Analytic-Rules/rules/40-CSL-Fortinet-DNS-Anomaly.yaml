@@ -1,0 +1,130 @@
+id: 8c4e2a71-6d05-49b3-8f2c-3e7a1b4d6c90
+name: "Fortinet DNS Anomaly - Tunnelling, High Volume and NXDOMAIN Flooding"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects anomalous FortiGate DNS activity from a single internal source host across three
+  independent shapes: an abnormally high query volume in a fifteen minute window, an
+  over-long or deeply nested DNS name with a long single label which is the signature of
+  dnscat2, iodine or dns2tcp tunnelling, and a high ratio of NXDOMAIN answers which indicates
+  domain generation algorithm or DNS bombing behaviour. A DNS tunnel is a low and slow
+  exfiltration channel that most perimeter controls miss because every query is a valid HTTPS
+  or DNS session on the wire, so the firewall DNS log is often the only place it becomes visible.
+  The benign case is a software update client, a container registry or a security product that
+  legitimately resolves thousands of names, so check the queried hostnames, the resolved DNS
+  server and whether the same host shows a matching pattern in proxy logs before escalating.
+  The NXDOMAIN ratio is derived from the rcode extension of the raw CEF string, so confirm the
+  connector populates the rcode extension in the target workspace.
+  MITRE ATT&CK: T1071.004, T1562.001
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 15m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CommandAndControl
+  - DefenseEvasion
+relevantTechniques:
+  - T1071.004
+  - T1562.001
+query: |
+  let HighVolumeThreshold = 300;
+  let TunnelQueryThreshold = 20;
+  let LongHostLength = 100;
+  let LongLabelLength = 30;
+  let DeepChainDepth = 5;
+  let NxDomainRatio = 0.80;
+  let DnsVolume =
+      CommonSecurityLog
+      | where TimeGenerated > ago(15m)
+      | where DeviceVendor == "Fortinet"
+      | where DeviceEventClassID has_any ("dns") or Activity has_any ("dns")
+      | where isnotempty(DestinationHostName)
+      | extend
+          HostLength = strlen(DestinationHostName),
+          LabelDepth = countof(DestinationHostName, "."),
+          RCode      = extract(@"rcode=(\d+)", 1, tostring(AdditionalExtensions)),
+          IsNxDomain = tolower(tostring(RCode)) == "3"
+      | summarize
+          QueryCount    = count(),
+          UniqueHosts   = dcount(DestinationHostName),
+          MaxHostLength = max(HostLength),
+          MaxLabelDepth = max(LabelDepth),
+          NxDomainCount = countif(IsNxDomain),
+          LongestHost   = arg_max(DestinationHostName, HostLength),
+          SampleHosts   = tostring(make_set(DestinationHostName, 5)),
+          DestServers   = tostring(make_set(DestinationIP, 5)),
+          FirstSeen     = min(TimeGenerated),
+          LastSeen      = max(TimeGenerated)
+        by SourceIP;
+  let DnsLabelShape =
+      CommonSecurityLog
+      | where TimeGenerated > ago(15m)
+      | where DeviceVendor == "Fortinet"
+      | where DeviceEventClassID has_any ("dns") or Activity has_any ("dns")
+      | where isnotempty(DestinationHostName)
+      | extend Labels = split(DestinationHostName, ".")
+      | mv-expand Label = Labels
+      | extend LabelLength = strlen(Label)
+      | summarize
+          MaxLabelLength = max(LabelLength),
+          UniqueLabels   = dcount(Label)
+        by SourceIP;
+  DnsVolume
+  | join kind=leftouter DnsLabelShape on $left.SourceIP == $right.SourceIP
+  | extend MaxLabelLength = iff(isempty(MaxLabelLength), 0, MaxLabelLength)
+  | extend NxRatio = iff(QueryCount > 0, round(toreal(NxDomainCount) / toreal(QueryCount), 2), 0.0)
+  | extend IsHighVolume = QueryCount >= HighVolumeThreshold
+  | extend IsLongHost = MaxHostLength >= LongHostLength
+  | extend IsLongLabel = MaxLabelLength >= LongLabelLength
+  | extend IsDeepChain = MaxLabelDepth >= DeepChainDepth
+  | extend IsHighNxRatio = NxRatio >= NxDomainRatio
+  | where IsHighVolume or IsLongHost or IsLongLabel or IsDeepChain or IsHighNxRatio
+  | extend AnomalyType = case(
+      IsLongLabel and QueryCount >= TunnelQueryThreshold, "DNS Tunnelling - Encoded Payload Label",
+      IsLongHost, "DNS Tunnelling - Over Long FQDN",
+      IsDeepChain, "DNS Tunnelling - Deep Subdomain Chain",
+      IsHighNxRatio and IsHighVolume, "DGA or DNS Flooding - High NXDOMAIN Ratio",
+      IsHighNxRatio, "Abnormal NXDOMAIN Ratio",
+      IsHighVolume, "Abnormal DNS Query Volume",
+      "DNS Anomaly")
+  | order by QueryCount desc, MaxLabelLength desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: DNS
+    fieldMappings:
+      - identifier: DomainName
+        columnName: LongestHost
+customDetails:
+  QueryCount: QueryCount
+  UniqueHosts: UniqueHosts
+  MaxHostLength: MaxHostLength
+  MaxLabelLength: MaxLabelLength
+  MaxLabelDepth: MaxLabelDepth
+  NxRatio: NxRatio
+  AnomalyType: AnomalyType
+  SampleHosts: SampleHosts
+  DestServers: DestServers
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet DNS Anomaly - {{SourceIP}} ({{AnomalyType}})"
+  alertDescriptionFormat: "Source {{SourceIP}} produced {{QueryCount}} DNS queries ({{UniqueHosts}} unique names, max label {{MaxLabelLength}} chars, max depth {{MaxLabelDepth}}, NXDOMAIN ratio {{NxRatio}}) classified as {{AnomalyType}}. Sample names: {{SampleHosts}}. Check for DNS tunnelling or DGA traffic."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT3H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []

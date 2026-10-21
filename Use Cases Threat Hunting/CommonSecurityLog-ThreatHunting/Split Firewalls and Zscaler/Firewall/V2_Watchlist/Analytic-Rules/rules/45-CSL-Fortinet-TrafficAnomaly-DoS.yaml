@@ -1,0 +1,101 @@
+id: 6b1d8e43-7a05-49c2-9f3d-0e8a4c6b2d71
+name: "Fortinet Traffic, IPS and Botnet Anomaly Events"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate anomaly events, covering the forward traffic anomaly, IPS anomaly, AV anomaly,
+  flood and denial of service subtypes that the gateway raises when session behaviour departs from
+  the configured profile, and it surfaces the same class of events that a botnet signature
+  produces. FortiGate anomaly logging is one of the cheapest ways to see volumetric abuse that
+  never forms a single recognisable pattern, such as a slow SYN flood, an HTTP flood or a
+  command and control burst from an infected host, and it is often the only place the volume is
+  visible because each individual session looks legitimate. The benign case is a genuine
+  capacity event such as a large legitimate download, a backup window or a software update, so
+  compare the byte totals against known business activity and check whether the source is an
+  internal or an external address. The rule groups on the source and destination pair and
+  requires a small minimum number of anomaly events or a large byte total so that a single
+  misclassified session does not become an alert.
+  MITRE ATT&CK: T1498, T1499
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Impact
+relevantTechniques:
+  - T1498
+  - T1499
+query: |
+  let AnomalyEventThreshold = 3;
+  let HighByteThreshold = 1073741824;
+  let AnomalySubTypes = dynamic([
+      "forward-anomaly", "ips-anomaly", "av-anomaly", "flood-anomaly",
+      "dos-anomaly", "botnet", "anomaly"]);
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where Activity has_any (AnomalySubTypes)
+      or DeviceEventClassID has_any ("anomaly")
+      or tolower(tostring(Message)) has_any ("anomaly", "flood", "botnet", "denial of service")
+  | extend AnomalyType = case(
+      Activity has_any ("forward-anomaly"), "Forward Traffic Anomaly",
+      Activity has_any ("ips-anomaly"), "IPS Anomaly",
+      Activity has_any ("av-anomaly"), "AV Anomaly",
+      Activity has_any ("flood-anomaly"), "Flood Anomaly",
+      Activity has_any ("dos-anomaly"), "Denial of Service Anomaly",
+      Activity has_any ("botnet"), "Botnet Event",
+      "Network Anomaly")
+  | summarize
+      AnomalyCount   = count(),
+      Destinations   = tostring(make_set(DestinationIP, 20)),
+      DestPorts      = tostring(make_set(DestinationPort, 10)),
+      Actions        = tostring(make_set(DeviceAction, 10)),
+      Severities     = tostring(make_set(LogSeverity, 5)),
+      AnomalyDetail  = tostring(make_set(DeviceCustomString1, 10)),
+      AnomalyMsgs    = tostring(make_set(Message, 5)),
+      TotalBytesSent = sum(SentBytes),
+      TotalBytesRecv = sum(ReceivedBytes),
+      FirstSeen      = min(TimeGenerated),
+      LastSeen       = max(TimeGenerated)
+    by AnomalyType, SourceIP, DestinationIP
+  | where AnomalyCount >= AnomalyEventThreshold
+      or TotalBytesSent >= HighByteThreshold
+      or TotalBytesRecv >= HighByteThreshold
+  | order by AnomalyCount desc, TotalBytesSent desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+customDetails:
+  AnomalyCount: AnomalyCount
+  AnomalyType: AnomalyType
+  Destinations: Destinations
+  DestPorts: DestPorts
+  DestinationIP: DestinationIP
+  Actions: Actions
+  Severities: Severities
+  AnomalyDetail: AnomalyDetail
+  TotalBytesSent: TotalBytesSent
+  TotalBytesRecv: TotalBytesRecv
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet {{AnomalyType}} - {{SourceIP}} to {{DestinationIP}} ({{AnomalyCount}} events)"
+  alertDescriptionFormat: "FortiGate raised {{AnomalyCount}} {{AnomalyType}} events from {{SourceIP}} towards {{DestinationIP}}. Ports {{DestPorts}}, actions {{Actions}}, {{TotalBytesSent}} bytes sent and {{TotalBytesRecv}} bytes received. Review for volumetric denial of service or botnet command and control."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []

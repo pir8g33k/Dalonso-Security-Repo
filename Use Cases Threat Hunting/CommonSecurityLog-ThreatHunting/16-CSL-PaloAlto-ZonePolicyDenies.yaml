@@ -3,11 +3,13 @@ name: "Palo Alto Networks - High-Volume Inter-Zone Policy Denies"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects high-volume Palo Alto Networks inter-zone policy deny events grouped by policy name
-  and zone pair (>50 denies). A spike in denies against a specific policy may indicate a zone
-  bypass attempt, misconfigured application, or an attacker testing firewall rules from a
-  compromised internal host. Policy names and zone context help distinguish automated tooling
-  from legitimate traffic.
+  Detects high-volume Palo Alto Networks inter-zone policy deny events grouped by
+  policy name and zone pair, more than 50 denies in one hour. A spike in denies against
+  a specific policy may indicate a zone bypass attempt, a misconfigured application,
+  or an attacker testing firewall rules from a compromised internal host. Policy
+  names and zone context help separate automated tooling from legitimate traffic.
+  Entity mappings were previously empty, so these alerts could never populate the
+  investigation graph.
   MITRE ATT&CK: T1562 (Impair Defenses), T1046 (Network Service Discovery)
 severity: Medium
 requiredDataConnectors:
@@ -15,7 +17,7 @@ requiredDataConnectors:
     dataTypes:
       - CommonSecurityLog
 queryFrequency: 1h
-queryPeriod: 1d
+queryPeriod: 1h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -25,15 +27,19 @@ relevantTechniques:
   - T1562
   - T1046
 query: |
+  let lookback = 1h;
+  let minDenies = 50;
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor == "Palo Alto Networks"
-  | where DeviceAction in ("deny", "drop", "reset-client", "reset-server", "reset-both",
-                           "Reset-Both", "Drop", "Deny")
+  | where tolower(DeviceAction) in ("deny", "drop", "reset-client", "reset-server",
+                                          "reset-both", "reject", "blocked")
   | where isnotempty(DeviceCustomString1) or isnotempty(DeviceCustomString2)
   | summarize
       DenyCount        = count(),
       SourceIPs        = make_set(SourceIP, 20),
+      RepresentativeSourceIP = any(SourceIP),
+      RepresentativeDestIP   = any(DestinationIP),
       DestinationIPs   = make_set(DestinationIP, 20),
       Ports            = make_set(DestinationPort, 10),
       Protocols        = make_set(Protocol, 5),
@@ -42,9 +48,17 @@ query: |
       FirstSeen        = min(TimeGenerated),
       LastSeen         = max(TimeGenerated)
     by DeviceCustomString1, DeviceCustomString2, DeviceAction
-  | where DenyCount > 50
+  | where DenyCount > minDenies
   | order by DenyCount desc
-entityMappings: []
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeDestIP
 customDetails:
   DenyCount: DenyCount
   DeviceCustomString1: DeviceCustomString1

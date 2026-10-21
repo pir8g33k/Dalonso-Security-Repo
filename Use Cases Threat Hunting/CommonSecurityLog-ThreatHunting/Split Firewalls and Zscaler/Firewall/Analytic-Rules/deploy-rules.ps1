@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Deploys 20 CommonSecurityLog Sentinel Analytic Rules (Fortinet / Palo Alto / Zscaler ZIA)
+    Deploys 26 CommonSecurityLog Sentinel Analytic Rules (Fortinet / Palo Alto / Zscaler ZIA)
     to a Microsoft Sentinel workspace via ARM template or individual YAML files.
 
 .DESCRIPTION
@@ -30,14 +30,14 @@
 
 .EXAMPLE
     # ARM deployment (recommended for first-time deployment)
-    .\deploy-csl-rules.ps1 `
+    .\deploy-rules.ps1 `
         -SubscriptionId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ResourceGroupName "rg-sentinel" `
         -WorkspaceName     "law-sentinel-prod"
 
 .EXAMPLE
     # YAML deployment (retains customDetails, incidentGrouping, etc.)
-    .\deploy-csl-rules.ps1 `
+    .\deploy-rules.ps1 `
         -SubscriptionId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ResourceGroupName "rg-sentinel" `
         -WorkspaceName     "law-sentinel-prod" `
@@ -45,10 +45,12 @@
 
 .NOTES
     Author : CyberSOC Engineering
-    Version: 1.0.0
-    Rules  : 20 Scheduled Analytic Rules — CommonSecurityLog (CEF)
+    Version: 1.1.0
+    Rules  : 26 Scheduled Analytic Rules — CommonSecurityLog (CEF)
     Vendors: Fortinet FortiGate, Palo Alto Networks, Zscaler ZIA
     Required connectors: CEF/Syslog for all three vendors
+    V2 notes: see ../V2_Watchlist/ for the watchlist-enhanced variant
+              (27 rules plus the NetworkAllowlist watchlist and function).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]

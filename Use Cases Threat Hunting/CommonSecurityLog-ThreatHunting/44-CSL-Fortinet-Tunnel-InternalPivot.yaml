@@ -1,0 +1,103 @@
+id: 9f3c6a05-2e78-4b41-8d9a-4c7b5e1f0a26
+name: "Fortinet VPN Tunnel Traffic Pivoting to Internal Destinations"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate traffic sessions where the source address sits on the internet facing side of
+  the tunnel while the destination is an internal RFC1918 address, which is the signature of
+  remote access traffic that has been tunnelled in and is now pivoting towards internal servers
+  and workstations. A session that lands on an administrative or file sharing port on an internal
+  host is the classic stepping stone for lateral movement once a VPN account has been stolen or
+  sold on. The benign case is a legitimate remote worker reaching an internal application, so
+  check the destination service, the port and whether the source address is a known remote user
+  address before treating the session as a pivot. The rule deliberately requires either more than
+  one distinct internal destination or a sensitive destination port so that a single published
+  DMZ service does not generate a flood of alerts, and the tunnel context fields are only a
+  corroborating signal because the connector may not populate them.
+  MITRE ATT&CK: T1020, T1133
+severity: High
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - Exfiltration
+relevantTechniques:
+  - T1020
+  - T1133
+query: |
+  let SensitivePorts = dynamic([
+      "22", "445", "135", "139", "3389", "5985", "5986", "1433", "3306",
+      "8080", "8443", "4648", "4649", "389", "636", "88"]);
+  let MinDistinctDestinations = 2;
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("traffic") or Activity has_any ("forward", "local-in")
+  | where isnotempty(SourceIP) and isnotempty(DestinationIP)
+  | where ipv4_is_valid(SourceIP) and ipv4_is_valid(DestinationIP)
+  | where ipv4_is_private(SourceIP) == false
+  | where ipv4_is_private(DestinationIP) == true
+  | extend DestPort = tostring(DestinationPort)
+  | extend IsSensitivePort = DestPort in (SensitivePorts)
+  | extend TunnelContext = Activity has_any ("vpn", "sslvpn", "ssl-vpn", "tunnel", "ipsec")
+      or tostring(AdditionalExtensions) has_any ("tunnelip", "remip", "tunneltype", "vpnuser", "vpn")
+  | summarize
+      SessionCount     = count(),
+      Destinations     = tostring(make_set(DestinationIP, 20)),
+      DistinctDests    = dcount(DestinationIP),
+      DestPorts        = tostring(make_set(DestinationPort, 10)),
+      SensitivePortHit = countif(IsSensitivePort),
+      TunnelContextHit = countif(TunnelContext),
+      AppProtocols     = tostring(make_set(ApplicationProtocol, 10)),
+      Users            = tostring(make_set(SourceUserName, 10)),
+      Account          = arg_max(SourceUserName, TimeGenerated),
+      TotalBytesSent   = sum(SentBytes),
+      TotalBytesRecv   = sum(ReceivedBytes),
+      Actions          = tostring(make_set(DeviceAction, 5)),
+      FirstSeen        = min(TimeGenerated),
+      LastSeen         = max(TimeGenerated)
+    by SourceIP
+  | where DistinctDests >= MinDistinctDestinations or SensitivePortHit > 0
+  | order by SensitivePortHit desc, DistinctDests desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+customDetails:
+  SessionCount: SessionCount
+  DistinctDests: DistinctDests
+  Destinations: Destinations
+  DestPorts: DestPorts
+  SensitivePortHit: SensitivePortHit
+  TunnelContextHit: TunnelContextHit
+  AppProtocols: AppProtocols
+  Users: Users
+  TotalBytesSent: TotalBytesSent
+  TotalBytesRecv: TotalBytesRecv
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet Tunnel Pivot - {{SourceIP}} to {{DistinctDests}} internal hosts"
+  alertDescriptionFormat: "Internet facing source {{SourceIP}} reached {{DistinctDests}} internal destinations on ports {{DestPorts}} ({{SensitivePortHit}} sensitive port sessions, tunnel context hits {{TunnelContextHit}}). Users {{Users}}, {{TotalBytesSent}} bytes sent. Review for lateral movement over a stolen VPN session."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []

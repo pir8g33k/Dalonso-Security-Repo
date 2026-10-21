@@ -3,17 +3,21 @@ name: "Firewall Allowed Traffic to High-Risk Country"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects allowed inbound or outbound firewall traffic to/from countries frequently associated
-  with nation-state threat actors and APT groups (CN, RU, KP, IR, SY, CU, BY, VE, AF, LY).
-  High-volume or repeated connections to these geographies may indicate C2 channels, data
-  exfiltration, or unauthorized access from threat actor infrastructure.
-  MITRE ATT&CK: T1078 (Valid Accounts)
+  Detects permitted inbound or outbound firewall traffic to or from countries
+  frequently associated with nation-state threat actors, using ISO 3166-1 alpha-2
+  country codes (CN, RU, KP, IR, SY, CU, BY, VE, AF, LY). The previous version matched
+  on English country names, which does not reliably match what the geolocation
+  provider actually returns.
+  Both directions are now evaluated, so inbound connections from a high-risk geography
+  are surfaced as well as outbound ones. This is a weak signal on its own and is
+  expected to be noisy for organisations with genuine business in these regions.
+  MITRE ATT&CK: T1078 (Valid Accounts), T1071 (Application Layer Protocol)
 severity: Medium
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
+queryFrequency: 1d
 queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
@@ -23,26 +27,33 @@ tactics:
 relevantTechniques:
   - T1078
 query: |
-  let HighRiskCountries = dynamic([
-      "China", "Russia", "North Korea", "Iran", "Syria",
-      "Cuba", "Belarus", "Venezuela", "Afghanistan", "Libya"]);
+  // ISO 3166-1 alpha-2 codes. Matching on the English country name was
+  // unreliable - the geolocation provider returns names such as
+  // "Russian Federation" and "Korea, Democratic People's Republic of".
+  let HighRiskCountryCodes = dynamic([
+      "CN", "RU", "KP", "IR", "SY", "CU", "BY", "VE", "AF", "LY"]);
   CommonSecurityLog
   | where TimeGenerated > ago(1d)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
-  | where isnotempty(DestinationIP)
-  | where ipv4_is_private(DestinationIP) == false
-  | extend DestCountry = tostring(geo_info_from_ip_address(DestinationIP).country)
-  | where DestCountry in (HighRiskCountries)
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+  | where isnotempty(SourceIP) and isnotempty(DestinationIP)
+  | extend DestCountryCode = tostring(geo_info_from_ip_address(DestinationIP).country_2)
+  | extend SrcCountryCode  = tostring(geo_info_from_ip_address(SourceIP).country_2)
+  | where DestCountryCode in (HighRiskCountryCodes)
+       or SrcCountryCode  in (HighRiskCountryCodes)
   | summarize
       ConnectionCount  = count(),
       BytesSent        = sum(SentBytes),
       InternalIPs      = make_set(SourceIP, 20),
       ExternalIPs      = make_set(DestinationIP, 20),
+      DestHostNames    = make_set(DestinationHostName, 10),
       FirstSeen        = min(TimeGenerated),
       LastSeen         = max(TimeGenerated),
       RepresentativeIP = any(SourceIP)
-    by DestCountry, DeviceVendor
+    by DestCountryCode, SrcCountryCode, DeviceVendor
   | order by ConnectionCount desc
 entityMappings:
   - entityType: IP
@@ -51,10 +62,11 @@ entityMappings:
         columnName: RepresentativeIP
 customDetails:
   ConnectionCount: ConnectionCount
-  DestCountry: DestCountry
+  DestCountryCode: DestCountryCode
+  SrcCountryCode: SrcCountryCode
 alertDetailsOverride:
-  alertDisplayNameFormat: "High-Risk Country Traffic Allowed - {{DestCountry}} ({{ConnectionCount}} connections)"
-  alertDescriptionFormat: "{{ConnectionCount}} allowed firewall connections to {{DestCountry}} detected. Review for C2 or data exfiltration."
+  alertDisplayNameFormat: "High-Risk Country Traffic Allowed - {{DestCountryCode}} ({{ConnectionCount}} connections)"
+  alertDescriptionFormat: "{{ConnectionCount}} allowed firewall connections to {{DestCountryCode}} detected. Review for C2 or data exfiltration."
 incidentConfiguration:
   createIncident: true
   groupingConfiguration:
