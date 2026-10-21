@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Deploys 20 CommonSecurityLog Sentinel Analytic Rules (Fortinet / Palo Alto / Zscaler ZIA)
+    Deploys 27 CommonSecurityLog Sentinel Analytic Rules (Fortinet / Palo Alto / Zscaler ZIA)
     to a Microsoft Sentinel workspace via ARM template or individual YAML files.
 
 .DESCRIPTION
@@ -28,16 +28,30 @@
     Path to the folder containing the YAML rule files.
     Defaults to .\rules\ relative to this script's location.
 
+.PARAMETER EnableAnalyticRules
+    ARM mode only. Sets the template's enableAnalyticRules parameter.
+    Pass -EnableAnalyticRules:$false for a staged deploy: the watchlist,
+    function and hunts deploy as normal, but every analytic rule is created
+    DISABLED so you can baseline the NetworkAllowlist first. Defaults to $true.
+
 .EXAMPLE
     # ARM deployment (recommended for first-time deployment)
-    .\deploy-csl-rules.ps1 `
+    .\deploy-rules.ps1 `
         -SubscriptionId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ResourceGroupName "rg-sentinel" `
         -WorkspaceName     "law-sentinel-prod"
 
 .EXAMPLE
+    # Staged ARM deployment (rules created disabled - baseline first)
+    .\deploy-rules.ps1 `
+        -SubscriptionId      "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+        -ResourceGroupName   "rg-sentinel" `
+        -WorkspaceName       "law-sentinel-prod" `
+        -EnableAnalyticRules:$false
+
+.EXAMPLE
     # YAML deployment (retains customDetails, incidentGrouping, etc.)
-    .\deploy-csl-rules.ps1 `
+    .\deploy-rules.ps1 `
         -SubscriptionId    "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
         -ResourceGroupName "rg-sentinel" `
         -WorkspaceName     "law-sentinel-prod" `
@@ -45,10 +59,14 @@
 
 .NOTES
     Author : CyberSOC Engineering
-    Version: 1.0.0
-    Rules  : 20 Scheduled Analytic Rules — CommonSecurityLog (CEF)
+    Version: 1.1.0
+    Rules  : 27 Scheduled Analytic Rules — CommonSecurityLog (CEF)
     Vendors: Fortinet FortiGate, Palo Alto Networks, Zscaler ZIA
     Required connectors: CEF/Syslog for all three vendors
+    V2 notes: deploys the NetworkAllowlist watchlist, the
+              ExcludeAllowlistedIPs_Firewall function, and the hunts
+              alongside the rules. Use -EnableAnalyticRules:$false for a
+              staged deploy (rules created disabled).
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -65,6 +83,8 @@ param (
 
     [ValidateSet('ARM', 'YAML')]
     [string] $DeploymentMode = 'ARM',
+
+    [bool] $EnableAnalyticRules = $true,
 
     [string] $RulesPath = (Join-Path $PSScriptRoot 'rules')
 )
@@ -157,7 +177,8 @@ function Deploy-ViaArm {
     param(
         [string] $ResourceGroupName,
         [string] $WorkspaceName,
-        [string] $ScriptRoot
+        [string] $ScriptRoot,
+        [bool]   $EnableAnalyticRules = $true
     )
 
     $templatePath = Join-Path $ScriptRoot 'azuredeploy.json'
@@ -168,7 +189,14 @@ function Deploy-ViaArm {
     Write-Step "Deploying ARM template: $templatePath"
 
     $deploymentName = "CSL-Rules-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-    $params = @{ workspace = $WorkspaceName }
+    $params = @{
+        workspace            = $WorkspaceName
+        enableAnalyticRules  = $EnableAnalyticRules
+    }
+
+    if (-not $EnableAnalyticRules) {
+        Write-Warn 'Staged deploy: analytic rules will be created DISABLED (enableAnalyticRules=$false).'
+    }
 
     $result = New-AzResourceGroupDeployment `
         -Name              $deploymentName `
@@ -294,7 +322,11 @@ Write-Header 'CommonSecurityLog Sentinel Analytic Rules Deployer'
 Write-Host "  Deployment mode : $DeploymentMode" -ForegroundColor Gray
 Write-Host "  Subscription    : $SubscriptionId" -ForegroundColor Gray
 Write-Host "  Resource Group  : $ResourceGroupName" -ForegroundColor Gray
-Write-Host "  Workspace       : $WorkspaceName`n" -ForegroundColor Gray
+Write-Host "  Workspace       : $WorkspaceName" -ForegroundColor Gray
+if ($DeploymentMode -eq 'ARM') {
+    Write-Host "  Rules enabled   : $EnableAnalyticRules" -ForegroundColor Gray
+}
+Write-Host ''
 
 Assert-Modules
 Connect-ToAzure -SubscriptionId $SubscriptionId
@@ -304,7 +336,8 @@ switch ($DeploymentMode) {
         Write-Header 'ARM Template Deployment'
         Deploy-ViaArm -ResourceGroupName $ResourceGroupName `
                       -WorkspaceName $WorkspaceName `
-                      -ScriptRoot $PSScriptRoot
+                      -ScriptRoot $PSScriptRoot `
+                      -EnableAnalyticRules $EnableAnalyticRules
     }
 
     'YAML' {

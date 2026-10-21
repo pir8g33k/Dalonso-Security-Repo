@@ -1,0 +1,108 @@
+id: 1e7a4c96-3b52-4d08-8c1f-5a9b3d6e0c48
+name: "Fortinet DLP Sensitive Data Pattern Match"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate data loss prevention events where a sensitive data pattern matched in the
+  inspected content, which is a direct confirmation that regulated or confidential data was
+  present in the traffic that the gateway just inspected. Depending on the DLP profile the
+  action may have been a block, a redaction or a detect only event, so the outcome is reported
+  alongside the pattern to separate a stopped transfer from one that was allowed through.
+  The benign case is a legitimate business transfer that a DLP rule over matches, for example a
+  supplier invoice containing a tax identifier, so check the matched pattern, the user and the
+  destination before escalating. The matched pattern name is carried in the CEF cs1 field and in
+  the pattern extension of the raw CEF string, and the profile and action in the profile and
+  action extensions, so confirm which of these the connector populates in the target workspace
+  before relying on the pattern column for triage. If neither the cs1 field nor the pattern
+  extension is available the rule falls back to the DLP event itself and reports the pattern
+  class as Other DLP Pattern.
+  MITRE ATT&CK: T1041
+severity: High
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+relevantTechniques:
+  - T1041
+query: |
+  let SensitivePatternTerms = dynamic([
+      "ssn", "social security", "credit card", "card number", "cardholder", "cvv", "cvc2",
+      "bank account", "iban", "swift code", "passport", "national id", "tax id",
+      "medical record", "health record", "patient", "diagnosis", "prescription",
+      "invoice", "payroll", "salary", "financial statement", "account balance",
+      "confidential", "proprietary", "source code", "api key", "licence key", "license key",
+      "password", "credential", "pci-dss", "hipaa", "pii", "gdpr"]);
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("dlp") or Activity has_any ("dlp")
+  | extend DLPPattern = iff(
+      isnotempty(DeviceCustomString1),
+      tostring(DeviceCustomString1),
+      tostring(extract(@"pattern=([^ ]+)", 1, tostring(AdditionalExtensions))))
+  | extend DLPAction = tostring(extract(@"action=([^ ]+)", 1, tostring(AdditionalExtensions)))
+  | extend DLPProfile = tostring(extract(@"profile=([^ ]+)", 1, tostring(AdditionalExtensions)))
+  | where isnotempty(DLPPattern)
+      or tolower(tostring(Message)) has_any ("dlp", "sensitive", "pattern")
+  | extend PatternClass = case(
+      DLPPattern has_any (SensitivePatternTerms) or tostring(Message) has_any (SensitivePatternTerms), "Sensitive Data Pattern",
+      "Other DLP Pattern")
+  | extend DLPOutcome = case(
+      tolower(tostring(DeviceAction)) in ("block", "blocked", "deny", "close", "redact", "quarantine"), "Blocked or Redacted",
+      tolower(tostring(DLPAction)) has_any ("block", "redact", "deny"), "Blocked or Redacted",
+      tolower(tostring(DeviceAction)) in ("allow", "accept"), "Allowed - Detected Only",
+      "Detected")
+  | summarize
+      MatchCount   = count(),
+      PatternList  = tostring(make_set(DLPPattern, 10)),
+      Outcomes     = tostring(make_set(DLPOutcome, 5)),
+      Profiles     = tostring(make_set(DLPProfile, 5)),
+      Users        = tostring(make_set(SourceUserName, 10)),
+      Account      = arg_max(SourceUserName, TimeGenerated),
+      Destinations = tostring(make_set(DestinationIP, 10)),
+      DataURL      = tostring(make_set(RequestURL, 5)),
+      BytesSent    = sum(SentBytes),
+      FirstSeen    = min(TimeGenerated),
+      LastSeen     = max(TimeGenerated)
+    by SourceIP, PatternClass, DLPOutcome
+  | order by MatchCount desc
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+customDetails:
+  MatchCount: MatchCount
+  PatternClass: PatternClass
+  PatternList: PatternList
+  Outcomes: Outcomes
+  Profiles: Profiles
+  Users: Users
+  Destinations: Destinations
+  DataURL: DataURL
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet DLP {{DLPOutcome}} - {{SourceIP}} ({{PatternClass}})"
+  alertDescriptionFormat: "DLP raised {{MatchCount}} sensitive data matches from {{SourceIP}} classified as {{PatternClass}} with outcome {{DLPOutcome}}. User {{Users}}, pattern {{PatternList}}, destinations {{Destinations}}. Confirm whether the transfer was authorised."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+    groupByAlertDetails: []
+    groupByCustomDetails: []

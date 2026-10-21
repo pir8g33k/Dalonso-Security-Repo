@@ -3,10 +3,13 @@ name: "Firewall Traffic to Threat Intelligence Flagged IP"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Correlates allowed firewall traffic (Fortinet, Palo Alto, Zscaler) against active Threat
-  Intelligence indicators from the ThreatIntelIndicators table. Any allowed connection
-  to a TI-flagged IP is a high-confidence indicator of compromise, C2 communication, or
-  active exploitation attempt.
+  Correlates permitted firewall traffic (Fortinet, Palo Alto, Zscaler) against active
+  threat intelligence indicators. Any permitted connection to a TI-flagged IP is a
+  high-confidence indicator of compromise, C2 communication, or active exploitation.
+  Both sides of the join are lower-cased before comparison, because the TI feed and the
+  firewall log disagree on capitalisation often enough to silently drop matches.
+  The traffic window is now one hour to match the schedule, so a TI match alerts once
+  when it is first seen rather than re-firing every fifteen minutes.
   MITRE ATT&CK: T1071 (Application Layer Protocol), T1078 (Valid Accounts)
 severity: High
 requiredDataConnectors:
@@ -16,8 +19,8 @@ requiredDataConnectors:
   - connectorId: ThreatIntelligence
     dataTypes:
       - ThreatIntelIndicators
-queryFrequency: 15m
-queryPeriod: 1d
+queryFrequency: 1h
+queryPeriod: 1h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -31,25 +34,35 @@ query: |
       ThreatIntelIndicators
       | where TimeGenerated > ago(30d)
       | where isempty(ValidUntil) or ValidUntil > now()
-      | where isnotnull(parse_ipv4(ObservableValue))
-      | where isnotempty(ObservableValue)
-      | summarize ThreatTypes = make_set(Tags), ConfidenceScore = max(Confidence)
-          by TI_IP = ObservableValue;
+      | where ObservableKey has "ip"
+      | where ipv4_is_valid(ObservableValue)
+      | summarize
+          ThreatTypes     = make_set(tostring(Tags), 10),
+          ConfidenceScore = max(Confidence),
+          IndicatorIds    = make_set(tostring(Id), 5)
+        by TI_IP = tolower(tostring(ObservableValue));
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(1h)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP", "Reset-Both")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(DestinationIP) or isnotempty(SourceIP)
-  | extend CheckIP = iff(ipv4_is_private(DestinationIP) == false, DestinationIP, SourceIP)
+  | extend CheckIP = tolower(tostring(iff(ipv4_is_private(DestinationIP) == false,
+                                                  DestinationIP, SourceIP)))
   | join kind=inner TI_IPs on $left.CheckIP == $right.TI_IP
   | summarize
       HitCount         = count(),
       InternalIPs      = make_set(SourceIP, 20),
+      RepresentativeIP = any(SourceIP),
+      DestIPs          = make_set(DestinationIP, 20),
       DeviceVendors    = make_set(DeviceVendor),
       FirstSeen        = min(TimeGenerated),
       LastSeen         = max(TimeGenerated),
-      ThreatTypes      = make_set(ThreatTypes),
-      ConfidenceScore  = max(ConfidenceScore)
+      ThreatTypes      = make_set(ThreatTypes, 10),
+      ConfidenceScore  = max(ConfidenceScore),
+      IndicatorIds     = make_set(IndicatorIds, 5)
     by TI_IP
   | order by HitCount desc
 entityMappings:
@@ -57,9 +70,14 @@ entityMappings:
     fieldMappings:
       - identifier: Address
         columnName: TI_IP
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeIP
 customDetails:
   HitCount: HitCount
   ConfidenceScore: ConfidenceScore
+  ThreatTypes: ThreatTypes
 alertDetailsOverride:
   alertDisplayNameFormat: "TI Match - Firewall Allowed Traffic to {{TI_IP}}"
   alertDescriptionFormat: "TI-flagged IP {{TI_IP}} (confidence: {{ConfidenceScore}}) was seen in {{HitCount}} allowed firewall events. Possible C2 communication or active IOC."

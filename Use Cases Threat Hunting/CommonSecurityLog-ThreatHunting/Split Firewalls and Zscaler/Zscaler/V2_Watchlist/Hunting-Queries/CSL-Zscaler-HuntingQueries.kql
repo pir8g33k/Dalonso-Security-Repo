@@ -1,4 +1,4 @@
-﻿// =============================================================================
+// =============================================================================
 // CommonSecurityLog - Zscaler ZIA/ZPA Threat Hunting Queries
 // Vendor: Zscaler ZIA, Zscaler ZPA
 // Generated: 2026-03-18
@@ -71,7 +71,8 @@ CommonSecurityLog
 CommonSecurityLog
 | where TimeGenerated > ago(24h)
 | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-| where Protocol in ("DNS", "dns") or DestinationPort == 53
+// DestinationPort is a STRING column, so the numeric comparison never matched.
+| where Protocol in ("DNS", "dns") or tostring(DestinationPort) == "53"
 | where isnotempty(DestinationHostName)
 | extend
     SubdomainLength = strlen(DestinationHostName),

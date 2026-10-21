@@ -3,19 +3,23 @@ name: "Protocol Anomaly - HTTP or HTTPS on Non-Standard Ports"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects allowed firewall or proxy connections using HTTP or HTTPS application protocols on
-  ports other than standard ones (80, 8080, 8000, 3128 for HTTP; 443, 8443 for HTTPS).
-  Many C2 frameworks (Cobalt Strike, Metasploit, custom RATs) use alternate ports combined
-  with HTTP/HTTPS to blend into web traffic while evading port-based firewall rules. This
-  pattern is a strong indicator of command-and-control channel establishment.
-  MITRE ATT&CK: T1571 (Non-Standard Port)
+  Detects permitted firewall or proxy connections using an HTTP or HTTPS application
+  protocol on a port other than the standard ones. Many C2 frameworks (Cobalt Strike,
+  Metasploit, custom implants) use alternate ports combined with HTTP or HTTPS to
+  blend into web traffic while evading port-based firewall rules. This pattern is a
+  strong indicator of command-and-control channel establishment.
+  The previous version compared DestinationPort against integer literals, but
+  DestinationPort is a string column, so the rule could never fire. It also tested
+  the Protocol column for HTTP, but Protocol carries the transport protocol
+  (TCP, UDP, ICMP) in CommonSecurityLog, so those branches were dead.
+  MITRE ATT&CK: T1571 (Non-Standard Port), T1071.001 (Web Protocols)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
 queryFrequency: 1h
-queryPeriod: 1d
+queryPeriod: 1h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -23,33 +27,53 @@ tactics:
 relevantTechniques:
   - T1571
 query: |
+  // DestinationPort is a STRING column. The previous integer comparison never matched.
+  // Protocol in CommonSecurityLog is the transport protocol (TCP/UDP/ICMP), never HTTP,
+  // so the Protocol-based HTTP checks were dead branches and have been removed.
+  let StandardHttpPorts  = dynamic(["80", "8080", "8000", "3128", "8888"]);
+  let StandardHttpsPorts = dynamic(["443", "8443", "4443"]);
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(1h)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
-  | where (ApplicationProtocol in ("HTTP", "http") and DestinationPort !in (80, 8080, 8000, 3128))
-      or (ApplicationProtocol in ("HTTPS", "https", "SSL", "ssl") and DestinationPort !in (443, 8443))
-      or (Protocol in ("HTTP", "http") and DestinationPort !in (80, 8080, 8000, 3128))
-      or (Protocol in ("HTTPS", "https") and DestinationPort !in (443, 8443))
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+  | extend AppProto = tolower(tostring(ApplicationProtocol))
+  | extend DstPort = tostring(DestinationPort)
+  | where (AppProto == "http" and DstPort !in (StandardHttpPorts))
+      or (AppProto in ("https", "ssl") and DstPort !in (StandardHttpsPorts))
   | summarize
-      ConnectionCount  = count(),
-      SourceIPs        = make_set(SourceIP, 20),
-      DestIPs          = make_set(DestinationIP, 20),
-      BytesSent        = sum(SentBytes),
-      URLSamples       = make_set(RequestURL, 10),
-      DeviceVendors    = make_set(DeviceVendor),
-      FirstSeen        = min(TimeGenerated),
-      LastSeen         = max(TimeGenerated)
-    by DestinationPort, ApplicationProtocol, Protocol
+      ConnectionCount   = count(),
+      SourceIPs         = make_set(SourceIP, 20),
+      RepresentativeSourceIP = any(SourceIP),
+      DestIPs           = make_set(DestinationIP, 20),
+      BytesSent         = sum(SentBytes),
+      URLSamples        = make_set(RequestURL, 10),
+      RepresentativeURL = any(RequestURL),
+      DestHostNames     = make_set(DestinationHostName, 10),
+      DeviceVendors     = make_set(DeviceVendor),
+      FirstSeen         = min(TimeGenerated),
+      LastSeen          = max(TimeGenerated)
+    by DstPort, AppProto
   | order by ConnectionCount desc
-entityMappings: []
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
+  - entityType: URL
+    fieldMappings:
+      - identifier: Url
+        columnName: RepresentativeURL
 customDetails:
   ConnectionCount: ConnectionCount
-  DestinationPort: DestinationPort
-  ApplicationProtocol: ApplicationProtocol
+  DstPort: DstPort
+  AppProto: AppProto
+  DestHostNames: DestHostNames
 alertDetailsOverride:
-  alertDisplayNameFormat: "Non-Standard Protocol Port - {{ApplicationProtocol}} on port {{DestinationPort}}"
-  alertDescriptionFormat: "{{ConnectionCount}} allowed connections using {{ApplicationProtocol}} on non-standard port {{DestinationPort}}. Possible C2 channel disguised as web traffic."
+  alertDisplayNameFormat: "Non-Standard Protocol Port - {{AppProto}} on port {{DstPort}}"
+  alertDescriptionFormat: "{{ConnectionCount}} allowed connections using {{AppProto}} on non-standard port {{DstPort}}. Possible C2 channel disguised as web traffic."
 incidentConfiguration:
   createIncident: true
   groupingConfiguration:

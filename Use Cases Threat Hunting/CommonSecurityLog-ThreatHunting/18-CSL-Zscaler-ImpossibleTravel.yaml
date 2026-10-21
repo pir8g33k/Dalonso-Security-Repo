@@ -28,10 +28,14 @@ query: |
   | where TimeGenerated > ago(1d)
   | where DeviceVendor == "Zscaler"
   | where isnotempty(SourceUserName)
-  | extend HourBucket = bin(TimeGenerated, 1h)
+  | where isnotempty(SourceIP)
+  | extend
+      UserCountry = tostring(geo_info_from_ip_address(SourceIP).country),
+      HourBucket  = bin(TimeGenerated, 1h)
+  | where isnotempty(UserCountry)
   | summarize
-      CountryCount     = dcount(SourceGeoCity),
-      Countries        = make_set(SourceGeoCity, 10),
+      CountryCount     = dcount(UserCountry),
+      Countries        = make_set(UserCountry, 10),
       RequestCount     = count(),
       SourceIPs        = make_set(SourceIP, 10),
       URLSamples       = make_set(RequestURL, 5)

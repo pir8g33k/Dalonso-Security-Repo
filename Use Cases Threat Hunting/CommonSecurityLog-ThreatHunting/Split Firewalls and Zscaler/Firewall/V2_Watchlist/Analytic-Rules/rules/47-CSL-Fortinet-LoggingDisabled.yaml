@@ -1,0 +1,100 @@
+id: c82b5f07-6d19-4a73-9e04-8b2a5c1d7f39
+name: "Fortinet Logging or Security Control Disabled"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate events that indicate logging or a security control was switched off, which
+  covers the log service being stopped, an administrator disabling a log setting such as event,
+  traffic or sniffer logging, and an administrator disabling a protective control such as admin
+  access, SSH, HTTPS, IPsec, DNS, web filtering, IPS or antivirus. An attacker who reaches the
+  FortiGate console will frequently silence the logging first, because an unlogged control
+  change removes the evidence of everything that follows, so this detection is about the
+  defender's visibility rather than about the change itself. The benign case is a planned
+  maintenance action where an engineer temporarily disables a feature, so always check the admin
+  identity and the change record before treating the event as malicious. The rule deliberately
+  requires a high severity event subtype, because FortiGate marks log and control tampering as
+  a critical or high event, and the message text is used to confirm the intent because the
+  subtype alone does not distinguish a change from a routine administrative logon.
+  MITRE ATT&CK: T1562.001, T1562.008
+severity: High
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 6h
+queryPeriod: 6h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+relevantTechniques:
+  - T1562.001
+  - T1562.008
+query: |
+  let ControlDisableTerms = dynamic([
+      "log service", "logs stopped", "log stopped", "stopped logging", "logging stopped",
+      "log disabled", "disable log", "disable logging", "disabled logging", "log setting",
+      "event log", "traffic log", "sniffer", "syslog",
+      "disable admin", "admin disabled", "disabled admin",
+      "disable ssh", "disable https", "disable telnet", "disable ipsec", "disable ssl",
+      "disable dns", "disable webfilter", "disable ips", "disable antivirus",
+      "disable forticloud", "disable fortiguard", "disable all", "disable local-in",
+      "disable console", "disable gui", "bypass", "tamper"]);
+  CommonSecurityLog
+  | where TimeGenerated > ago(6h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("event") or Activity has_any ("system", "admin", "config", "admin-login")
+  | where tolower(tostring(LogSeverity)) == "high"
+  | extend Msg = tolower(tostring(Message))
+  | extend Ext = tolower(tostring(AdditionalExtensions))
+  | where Msg has_any (ControlDisableTerms) or Ext has_any (ControlDisableTerms)
+  | extend ControlType = case(
+      Msg has_any ("log service", "logs stopped", "log stopped", "stopped logging", "logging stopped", "log disabled", "disable log", "disable logging", "disabled logging", "log setting", "event log", "traffic log", "sniffer", "syslog"), "Logging Service or Setting Disabled",
+      Msg has_any ("disable admin", "admin disabled", "disabled admin", "disable ssh", "disable https", "disable telnet", "disable ipsec", "disable ssl", "disable dns", "disable webfilter", "disable ips", "disable antivirus", "disable forticloud", "disable fortiguard", "disable all", "disable local-in", "disable console", "disable gui"), "Security Control Disabled",
+      Msg has_any ("bypass", "tamper"), "Control Bypass or Tamper",
+      "High Severity System or Admin Event")
+  | summarize
+      EventCount  = count(),
+      Admins      = tostring(make_set(SourceUserName, 10)),
+      Account     = arg_max(SourceUserName, TimeGenerated),
+      Messages    = tostring(make_set(Message, 5)),
+      Activities  = tostring(make_set(Activity, 10)),
+      Actions     = tostring(make_set(DeviceAction, 5)),
+      FortiOS     = tostring(make_set(DeviceVersion, 3)),
+      FirstSeen   = min(TimeGenerated),
+      LastSeen    = max(TimeGenerated)
+    by ControlType, SourceIP
+  | order by EventCount desc
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+customDetails:
+  EventCount: EventCount
+  ControlType: ControlType
+  Admins: Admins
+  Messages: Messages
+  Activities: Activities
+  Actions: Actions
+  FortiOS: FortiOS
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet {{ControlType}} - {{SourceIP}} ({{EventCount}} events)"
+  alertDescriptionFormat: "FortiGate recorded {{EventCount}} high severity event(s) of type {{ControlType}} from {{SourceIP}}. Admin {{Admins}}. Messages {{Messages}}. Confirm whether a legitimate maintenance window authorised the change, otherwise assume visibility has been reduced deliberately."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT12H
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+    groupByAlertDetails: []
+    groupByCustomDetails: []

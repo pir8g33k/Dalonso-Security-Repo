@@ -3,12 +3,17 @@ name: "Correlation: Firewall Traffic from High-Risk Identity (IdentityInfo)"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Correlates Fortinet, Palo Alto, and Zscaler firewall/proxy allowed traffic with the
-  IdentityInfo table (UEBA) to identify accounts flagged with elevated investigation priority
-  that are actively generating significant traffic volume. A high-risk or compromised identity
-  generating large firewall sessions amplifies the exfiltration or lateral movement risk and
-  should be prioritized for investigation.
-  Requires: Microsoft Sentinel UEBA (IdentityInfo populated by BehaviorAnalytics).
+  Correlates permitted firewall and proxy traffic with the IdentityInfo table (UEBA) to
+  identify accounts flagged with elevated investigation priority that are actively
+  generating significant traffic volume. A high-risk or compromised identity
+  generating large firewall sessions amplifies exfiltration and lateral movement risk
+  and should be prioritised for investigation.
+  The previous version joined the firewall user directly against AccountUPN. FortiGate
+  writes the user as DOMAIN\user or user@domain, never as a bare UPN, so the join never
+  matched and the rule never fired. The comparison now uses the local part of the
+  account name on both sides, which also matches the plain usernames that Zscaler
+  records.
+  Requires: Microsoft Sentinel UEBA, with IdentityInfo populated by BehaviorAnalytics.
   MITRE ATT&CK: T1078 (Valid Accounts)
 severity: High
 requiredDataConnectors:
@@ -18,7 +23,7 @@ requiredDataConnectors:
   - connectorId: BehaviorAnalytics
     dataTypes:
       - BehaviorAnalytics
-queryFrequency: 1h
+queryFrequency: 1d
 queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
@@ -38,12 +43,20 @@ query: |
           Department       = any(Department),
           Manager          = any(Manager),
           IsAccountEnabled = any(IsAccountEnabled)
-        by AccountUPN;
+        by AccountUPN = tolower(tostring(AccountUPN));
   CommonSecurityLog
   | where TimeGenerated > ago(1d)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
-  | where DeviceAction !in ("deny", "block", "drop", "BLOCK", "DROP")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(SourceUserName)
+  // FortiGate writes the user as DOMAIN\user or user@domain, never as a bare UPN,
+  // so the previous UPN-to-UPN join never matched and the rule never fired.
+  // Compare the local part of the account name on both sides instead.
+  | extend UserLocal = tolower(tostring(split(split(tostring(SourceUserName), "@")[0], "\\")[0]))
+  | where isnotempty(UserLocal)
   | summarize
       FW_RequestCount  = count(),
       FW_BytesSent     = sum(SentBytes),
@@ -51,8 +64,10 @@ query: |
       FW_DestIPs       = dcount(DestinationIP),
       FW_Vendors       = make_set(DeviceVendor),
       FW_SrcIPs        = make_set(SourceIP, 5),
+      RepresentativeSourceIP = any(SourceIP),
+      FW_Accounts      = make_set(tostring(SourceUserName), 10),
       FW_FirstSeen     = min(TimeGenerated)
-    by UserName = tolower(SourceUserName)
+    by UserName = UserLocal
   | join kind=inner RiskyIdentities on $left.UserName == $right.AccountUPN
   | extend TotalMBSent = round(toreal(FW_BytesSent) / 1048576, 2)
   | project
@@ -71,10 +86,15 @@ entityMappings:
     fieldMappings:
       - identifier: FullName
         columnName: UserName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
 customDetails:
   RiskScore: RiskScore
   TotalMBSent: TotalMBSent
   FW_RequestCount: FW_RequestCount
+  FW_DestIPs: FW_DestIPs
 alertDetailsOverride:
   alertDisplayNameFormat: "Risky Identity Firewall Activity - {{UserName}} (risk: {{RiskScore}})"
   alertDescriptionFormat: "High-risk user {{UserName}} (investigation priority: {{RiskScore}}) generated {{TotalMBSent}} MB through the firewall. Identity risk combined with high traffic volume is a critical exfiltration or abuse indicator."

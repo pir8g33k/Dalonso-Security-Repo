@@ -3,10 +3,13 @@ name: "Firewall Port Scan Detection - Vertical and Horizontal Sweeps"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects network reconnaissance activity by identifying source IPs that contact more than
-  30 unique destination ports (vertical/port sweep) or more than 50 unique destination IPs
-  (horizontal/host sweep) within a 1-hour window. Both patterns indicate active network
-  mapping or exploitation preparation.
+  Detects network reconnaissance by identifying source IPs that contact more than 30
+  unique destination ports (vertical sweep) or more than 50 unique destination IPs
+  (horizontal sweep) within one hour. Both patterns indicate active network mapping or
+  exploitation preparation.
+  The rule now separates sweeps that policy permitted from sweeps the firewall blocked.
+  A FortiGate that denies the sweep is working; a sweep that succeeds is the finding
+  that matters, and ScanOutcome surfaces the difference at a glance.
   MITRE ATT&CK: T1046 (Network Service Discovery)
 severity: Medium
 requiredDataConnectors:
@@ -22,24 +25,34 @@ tactics:
 relevantTechniques:
   - T1046
 query: |
+  let lookback = 1h;
+  let minPorts = 30;
+  let minIPs = 50;
   CommonSecurityLog
-  | where TimeGenerated > ago(1h)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
   | where isnotempty(SourceIP) and isnotempty(DestinationIP)
   | summarize
-      UniqueDestPorts = dcount(DestinationPort),
-      UniqueDestIPs   = dcount(DestinationIP),
-      TotalAttempts   = count(),
-      Actions         = make_set(DeviceAction, 5),
-      Protocols       = make_set(Protocol, 5),
-      FirstSeen       = min(TimeGenerated),
-      LastSeen        = max(TimeGenerated)
+      UniqueDestPorts  = dcount(DestinationPort),
+      UniqueDestIPs    = dcount(DestinationIP),
+      TotalAttempts    = count(),
+      AcceptedAttempts = countif(tolower(DeviceAction) in ("accept", "allowed", "allow")),
+      DeniedAttempts   = countif(tolower(DeviceAction) in ("deny", "drop", "blocked", "reject")),
+      Actions          = make_set(DeviceAction, 5),
+      Protocols        = make_set(Protocol, 5),
+      TargetIPs        = make_set(DestinationIP, 20),
+      FirstSeen        = min(TimeGenerated),
+      LastSeen         = max(TimeGenerated)
     by SourceIP, DeviceVendor
-  | where UniqueDestPorts > 30 or UniqueDestIPs > 50
+  | where UniqueDestPorts > minPorts or UniqueDestIPs > minIPs
   | extend ScanType = case(
-      UniqueDestPorts > 30 and UniqueDestIPs <= 10, "Vertical Scan (port sweep)",
-      UniqueDestIPs   > 50 and UniqueDestPorts <= 5, "Horizontal Scan (host sweep)",
+      UniqueDestPorts > minPorts and UniqueDestIPs <= 10, "Vertical Scan (port sweep)",
+      UniqueDestIPs   > minIPs   and UniqueDestPorts <= 5,  "Horizontal Scan (host sweep)",
       "Combined Scan")
+  // A sweep that was PERMITTED matters far more than one the firewall blocked.
+  | extend ScanOutcome = iff(AcceptedAttempts > 0,
+                           "Partially or fully permitted",
+                           "Blocked")
   | order by UniqueDestPorts desc, UniqueDestIPs desc
 entityMappings:
   - entityType: IP
@@ -50,6 +63,8 @@ customDetails:
   UniqueDestPorts: UniqueDestPorts
   UniqueDestIPs: UniqueDestIPs
   TotalAttempts: TotalAttempts
+  AcceptedAttempts: AcceptedAttempts
+  ScanOutcome: ScanOutcome
 alertDetailsOverride:
   alertDisplayNameFormat: "Port Scan Detected - {{SourceIP}} hit {{UniqueDestPorts}} ports"
   alertDescriptionFormat: "Source {{SourceIP}} targeted {{UniqueDestIPs}} IPs across {{UniqueDestPorts}} unique ports. Possible network reconnaissance activity."

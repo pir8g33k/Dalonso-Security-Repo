@@ -1,0 +1,100 @@
+id: b0c1d2e3-f4a5-4b6c-7d8e-9f0a1b2c3d4f
+name: "Anomalous User Firewall Activity - High Request Count or Data Volume"
+version: 1.1.0
+kind: Scheduled
+description: |
+  Detects users generating more than 1,000 permitted firewall requests or sending more than
+  200 MB outbound in 24 hours across Fortinet, Palo Alto or Zscaler. Anomalously high per-user
+  traffic volume is a strong indicator of a compromised account, bulk exfiltration, or insider
+  threat activity, and unlike the IdentityInfo correlation it does not require the Sentinel UEBA
+  connector to be deployed.
+  The permitted-traffic filter is a positive allow-list, because FortiGate reports act=blocked for
+  UTM blocks and the previous deny-list counted blocked traffic as permitted.
+  The account is identified by the local part of the username, since FortiGate records the user as
+  DOMAIN\user or user@domain rather than a bare UPN.
+  MITRE ATT&CK: T1078 (Valid Accounts), T1048 (Exfiltration Over Alternative Protocol)
+severity: High
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1d
+queryPeriod: 1d
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - Exfiltration
+relevantTechniques:
+  - T1078
+  - T1048
+query: |
+  let lookback = 1d;
+  let minRequests = 1000;
+  let minMB = 200.0;
+  let criticalMB = 1000.0;
+  let highMB = 500.0;
+  let highRequests = 5000;
+  CommonSecurityLog
+  | where TimeGenerated > ago(lookback)
+  | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
+  | where isnotempty(SourceUserName)
+  | extend UserLocal = tolower(tostring(split(split(tostring(SourceUserName), "@")[0], "\\")[0]))
+  | where isnotempty(UserLocal)
+  | summarize
+      FW_RequestCount  = count(),
+      FW_BytesSent     = sum(SentBytes),
+      FW_BytesRecv     = sum(ReceivedBytes),
+      FW_DestIPs       = dcount(DestinationIP),
+      FW_Vendors       = make_set(DeviceVendor),
+      FW_SrcIPs        = make_set(SourceIP, 5),
+      RepresentativeSourceIP = any(SourceIP),
+      FW_Accounts      = make_set(tostring(SourceUserName), 10),
+      FW_FirstSeen     = min(TimeGenerated)
+    by UserName = UserLocal
+  | extend TotalMBSent = round(toreal(FW_BytesSent) / 1048576, 2)
+  | where FW_RequestCount > minRequests or TotalMBSent > minMB
+  | extend RiskScore = case(
+      TotalMBSent > criticalMB, "Critical",
+      TotalMBSent > highMB or FW_RequestCount > highRequests, "High",
+      "Medium")
+  | project
+      UserName,
+      FW_RequestCount,
+      TotalMBSent,
+      FW_DestIPs,
+      FW_Vendors,
+      FW_SrcIPs,
+      RepresentativeSourceIP,
+      RiskScore
+  | order by TotalMBSent desc, FW_RequestCount desc
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: UserName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
+customDetails:
+  FW_RequestCount: FW_RequestCount
+  TotalMBSent: TotalMBSent
+  RiskScore: RiskScore
+  FW_DestIPs: FW_DestIPs
+alertDetailsOverride:
+  alertDisplayNameFormat: "High-Volume User Activity - {{UserName}} ({{TotalMBSent}} MB / {{FW_RequestCount}} reqs)"
+  alertDescriptionFormat: "User {{UserName}} generated {{TotalMBSent}} MB and {{FW_RequestCount}} firewall requests in 24h, scored {{RiskScore}}. Possible data exfiltration or compromised account. This rule needs no UEBA connector."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT12H
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+    groupByAlertDetails: []
+    groupByCustomDetails:
+      - RiskScore

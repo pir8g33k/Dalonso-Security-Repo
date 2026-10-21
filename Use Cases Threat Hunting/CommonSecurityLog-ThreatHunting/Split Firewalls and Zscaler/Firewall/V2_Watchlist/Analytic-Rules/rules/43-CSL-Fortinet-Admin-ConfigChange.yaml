@@ -1,0 +1,95 @@
+id: 4d6a8f21-7b39-4e05-8a7c-5f2b1d9e3c68
+name: "Fortinet Administrative and Configuration Change"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate administrative and configuration events, covering administrative logons,
+  configuration and object changes, policy changes and the creation or modification of local,
+  remote, LDAP and RADIUS user accounts. A change made in the FortiGate console or CLI is the
+  single most powerful persistence and defence evasion action available to an attacker who has
+  obtained administrative access, because it can add a new administrator, disable logging,
+  open a firewall policy or weaken a security profile in a single action. The benign case is a
+  change made by a network engineer during a planned maintenance window, so the first check is
+  always the admin identity and whether a change ticket exists for that source address. The
+  message text is used to classify the change because FortiGate does not expose a dedicated
+  subtype for configuration objects, so the rule matches on the human readable message and the
+  event subtype together.
+  MITRE ATT&CK: T1098, T1078
+severity: High
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Persistence
+  - PrivilegeEscalation
+  - InitialAccess
+relevantTechniques:
+  - T1098
+  - T1078
+query: |
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("event") or Activity has_any ("admin-login", "admin", "user", "system", "config", "login")
+  | extend Msg = tolower(tostring(Message))
+  | extend Ext = tolower(tostring(AdditionalExtensions))
+  | extend ChangeKind = case(
+      Msg has_any ("user created", "user added", "user deleted", "user modified", "user updated", "password changed", "password set", "group created", "group deleted", "admin created", "admin deleted", "admin updated", "administrator created", "sso user", "ldap user", "radius user", "local user created", "remote user created"), "Account or Credential Change",
+      Msg has_any ("config", "configuration") or Ext has_any ("config"), "Configuration Change",
+      Msg has_any ("policy", "address group", "service group", "static route", "ipsec phase") or Ext has_any ("policy"), "Policy or Object Change",
+      Activity has_any ("admin-login"), "Administrative Login",
+      Msg has_any ("disabled", "disable", "enabled", "changed", "updated", "modified", "created", "deleted", "added", "removed", "upgraded", "imported", "exported", "stopped", "restarted"), "System or Setting Change",
+      "Other Administrative Event")
+  | where ChangeKind != "Other Administrative Event"
+  | summarize
+      EventCount  = count(),
+      Admins      = tostring(make_set(SourceUserName, 10)),
+      Account     = arg_max(SourceUserName, TimeGenerated),
+      MessageList = tostring(make_set(Message, 5)),
+      Actions     = tostring(make_set(DeviceAction, 5)),
+      Activities  = tostring(make_set(Activity, 10)),
+      Severities  = tostring(make_set(LogSeverity, 5)),
+      FortiOS     = tostring(make_set(DeviceVersion, 3)),
+      FirstSeen   = min(TimeGenerated),
+      LastSeen    = max(TimeGenerated)
+    by ChangeKind, SourceIP
+  | order by ChangeKind asc, EventCount desc
+entityMappings:
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+customDetails:
+  EventCount: EventCount
+  ChangeKind: ChangeKind
+  Admins: Admins
+  MessageList: MessageList
+  Actions: Actions
+  Activities: Activities
+  Severities: Severities
+  FortiOS: FortiOS
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet Admin Change - {{ChangeKind}} from {{SourceIP}}"
+  alertDescriptionFormat: "{{ChangeKind}} performed from {{SourceIP}} by admin {{Admins}} ({{EventCount}} events). Messages {{MessageList}}. Verify the change against an approved change ticket and confirm the admin identity."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - Account
+    groupByAlertDetails: []
+    groupByCustomDetails: []

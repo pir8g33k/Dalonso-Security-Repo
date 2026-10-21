@@ -3,18 +3,19 @@ name: "Palo Alto Networks - Threat Log Events (Spyware, Wildfire, Vulnerability)
 version: 1.0.0
 kind: Scheduled
 description: |
-  Surfaces Palo Alto Networks threat log entries for malware, spyware, wildfire, vulnerability,
-  and virus events that triggered more than 5 times in 24 hours. These events indicate active
-  threat detection by the firewall's content inspection engine. High-frequency threat events
-  from a single source often indicate malware activity, active C2 communications, or
-  lateral exploitation.
+  Surfaces Palo Alto Networks threat log entries for malware, spyware, wildfire,
+  vulnerability and virus events that triggered more than 5 times in 24 hours. These
+  indicate active detection by the firewall's content inspection engine, and repeated
+  threat events from one source often mean malware activity or active C2 traffic.
+  Entity mappings were previously empty, so these alerts could never populate the
+  investigation graph or drive incident grouping.
   MITRE ATT&CK: T1190 (Exploit Public-Facing Application), T1071 (Application Layer Protocol)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
+queryFrequency: 1d
 queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
@@ -33,6 +34,8 @@ query: |
   | summarize
       HitCount         = count(),
       SourceIPs        = make_set(SourceIP, 20),
+      RepresentativeSourceIP = any(SourceIP),
+      RepresentativeDestIP   = any(DestinationIP),
       DestinationIPs   = make_set(DestinationIP, 20),
       DestinationURLs  = make_set(RequestURL, 10),
       SeverityValues   = make_set(LogSeverity, 5),
@@ -42,7 +45,15 @@ query: |
     by Activity, DeviceEventClassID
   | where HitCount > 5
   | order by HitCount desc
-entityMappings: []
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeDestIP
 customDetails:
   HitCount: HitCount
   Activity: Activity

@@ -1,20 +1,29 @@
 id: a7b8c9d0-e1f2-4a3b-4c5d-6e7f8a9b0c1d
-name: "Fortinet IPS - High-Frequency Intrusion Prevention Alerts"
-version: 1.0.0
+name: "Fortinet FortiGate - UTM, IPS and Malware Events by Source"
+version: 1.1.0
 kind: Scheduled
 description: |
-  Surfaces Fortinet IPS and Application Control block events that occurred more than 10 times
-  in a 24-hour period. Repeated IPS hits against the same signature from the same source may
-  indicate an active exploitation attempt, automated attack tooling, or a compromised internal
-  host attempting to exploit adjacent systems.
-  MITRE ATT&CK: T1190 (Exploit Public-Facing Application), T1203 (Exploitation for Client Execution)
+  Detects FortiGate UTM events raised by the gateway - IPS signatures, antivirus, anti-bot,
+  file blocking and application control - grouped by the source that triggered them. Repeated
+  hits on the same source indicate an automated exploitation attempt, a drive-by infection
+  chain, or a compromised internal host probing adjacent systems.
+  Two FortiGate specifics drive the rule. DeviceAction is "blocked" when the gateway enforced
+  the policy and "accept" when it only detected, so the rule reports the enforcement split
+  separately - a "detected but not blocked" hit is the one that needs attention first, because
+  it means the control exists and did not fire. The IPS signature name is read from
+  DeviceCustomString1 when the connector populates it and is otherwise recovered from the
+  catdesc key inside AdditionalExtensions; confirm which of the two your connector populates,
+  because the field lands in different places depending on the ingestion path.
+  BroadExploitation marks a source that triggered several different signatures in the same
+  window, which is the difference between one noisy site and a sweep.
+  MITRE ATT&CK: T1190 (Exploit Public-Facing Application), T1203 (Exploitation for Client Execution), T1105 (Ingress Tool Transfer)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
 queryFrequency: 1h
-queryPeriod: 1d
+queryPeriod: 1h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -22,39 +31,77 @@ tactics:
   - Execution
 relevantTechniques:
   - T1190
-  - T1203
+  - T1105
 query: |
+  let lookback = 1h;
+  let minHits = 3;
+  let minDistinctSignatures = 5;
+  // FortiGate log category, carried in DeviceEventClassID on some ingestion
+  // paths and in Activity on others, so both are tested.
+  let utmCategories = dynamic(["utm", "app-ctrl", "antivirus", "webfilter", "ssl"]);
+  let utmSubtypes  = dynamic(["ips", "ips-packet", "av", "antibot", "file-block",
+                              "appctrl", "webfilter", "fct-utm", "ips-anomaly",
+                              "av-anomaly"]);
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(lookback)
   | where DeviceVendor == "Fortinet"
-  | where DeviceEventClassID has_any ("IPS", "anomaly", "signature")
-      or Activity has_any ("ips-packet", "app-ctrl", "anomaly")
+  | where tolower(DeviceEventClassID) in (utmCategories)
+      or tolower(Activity) in (utmSubtypes)
+  | extend IPSSignature = iff(isnotempty(DeviceCustomString1),
+                              tostring(DeviceCustomString1),
+                              extract(@"catdesc=([^ ]+)", 1, tostring(AdditionalExtensions)))
+  | extend IPSSignature = iff(isempty(IPSSignature), tostring(Activity), IPSSignature)
+  | where isnotempty(SourceIP)
   | summarize
-      HitCount         = count(),
-      SourceIPs        = make_set(SourceIP, 20),
-      DestinationIPs   = make_set(DestinationIP, 20),
-      ProtocolsUsed    = make_set(Protocol, 5),
-      SeverityValues   = make_set(LogSeverity, 5),
-      FirstSeen        = min(TimeGenerated),
-      LastSeen         = max(TimeGenerated)
-    by Activity, DeviceEventClassID
-  | where HitCount > 10
+      HitCount             = count(),
+      BlockedCount         = countif(tolower(DeviceAction) == "blocked"),
+      DetectedOnlyCount    = countif(tolower(DeviceAction) == "accept"),
+      DistinctSignatures   = dcount(IPSSignature),
+      Signatures           = make_set(IPSSignature, 20),
+      DestinationIPs       = make_set(DestinationIP, 20),
+      Users                = make_set(SourceUserName, 10),
+      RequestURLs          = make_set(RequestURL, 10),
+      DestHostNames        = make_set(DestinationHostName, 10),
+      Severities           = make_set(LogSeverity, 5),
+      Apps                 = make_set(ApplicationProtocol, 5),
+      RepresentativeDestIP = any(DestinationIP),
+      FirstSeen            = min(TimeGenerated),
+      LastSeen             = max(TimeGenerated)
+    by SourceIP
+  | where HitCount > minHits
+  | extend Enforcement = iff(BlockedCount == 0,
+                             "Detected but NOT blocked",
+                             iff(DetectedOnlyCount == 0, "Blocked", "Mixed"))
+  | extend BroadExploitation = DistinctSignatures >= minDistinctSignatures
   | order by HitCount desc
-entityMappings: []
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeDestIP
 customDetails:
   HitCount: HitCount
-  Activity: Activity
+  BlockedCount: BlockedCount
+  DistinctSignatures: DistinctSignatures
+  Enforcement: Enforcement
+  BroadExploitation: BroadExploitation
+  Severities: Severities
 alertDetailsOverride:
-  alertDisplayNameFormat: "Fortinet IPS Alert - {{Activity}} ({{HitCount}} hits)"
-  alertDescriptionFormat: "Fortinet IPS/App Control signature {{Activity}} triggered {{HitCount}} events. Review source IPs and affected destinations for active exploitation."
+  alertDisplayNameFormat: "FortiGate UTM - {{DistinctSignatures}} signature(s) from {{SourceIP}} ({{HitCount}} hits, {{Enforcement}})"
+  alertDescriptionFormat: "Source {{SourceIP}} triggered {{HitCount}} FortiGate UTM events across {{DistinctSignatures}} distinct signatures ({{BlockedCount}} blocked). Signatures: {{Signatures}}. If Enforcement is 'Detected but NOT blocked' the control did not fire."
 incidentConfiguration:
   createIncident: true
   groupingConfiguration:
     enabled: true
     reopenClosedIncident: false
-    lookbackDuration: PT12H
-    matchingMethod: AnyAlert
-    groupByEntities: []
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
     groupByAlertDetails: []
     groupByCustomDetails:
-      - Activity
+      - Enforcement

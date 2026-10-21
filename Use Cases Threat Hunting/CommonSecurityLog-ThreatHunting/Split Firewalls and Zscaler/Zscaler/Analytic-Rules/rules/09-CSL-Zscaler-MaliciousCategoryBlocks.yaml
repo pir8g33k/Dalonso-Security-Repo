@@ -3,10 +3,13 @@ name: "Zscaler ZIA - Blocked Request to Malicious / C2 Category"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Detects Zscaler ZIA blocked web requests categorized as botnet, malware, phishing, ransomware,
-  command-and-control, or anonymous proxy destinations. Blocked events confirm the user or host
-  attempted to communicate with a known-malicious destination. Repeated attempts despite blocking
-  may indicate malware that is persistently trying to reach its C2 infrastructure.
+  Detects Zscaler ZIA blocked web requests categorized as botnet, malware, phishing,
+  ransomware, command-and-control, or anonymous proxy destinations. Blocked events
+  confirm the user or host attempted to communicate with a known-malicious destination.
+  Repeated attempts despite blocking may indicate malware that is persistently trying
+  to reach its C2 infrastructure.
+  Entity mappings were previously empty, so these alerts could never populate the
+  investigation graph or drive incident grouping.
   MITRE ATT&CK: T1071 (Application Layer Protocol)
 severity: High
 requiredDataConnectors:
@@ -40,11 +43,21 @@ query: |
       DestinationURLs  = make_set(RequestURL, 20),
       DestIPs          = make_set(DestinationIP, 10),
       Categories       = make_set(DeviceCustomString2, 10),
+      RepresentativeSourceIP = any(SourceIP),
+      RepresentativeUser    = any(SourceUserName),
       FirstSeen        = min(TimeGenerated),
       LastSeen         = max(TimeGenerated)
     by DeviceCustomString2, DeviceCustomString3
   | order by BlockCount desc
-entityMappings: []
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: RepresentativeUser
 customDetails:
   BlockCount: BlockCount
   UniqueUsers: UniqueUsers

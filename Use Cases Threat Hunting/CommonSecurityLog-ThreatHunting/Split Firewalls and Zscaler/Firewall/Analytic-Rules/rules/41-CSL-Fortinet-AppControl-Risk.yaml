@@ -1,0 +1,107 @@
+id: 2a7f3b58-9e14-4c86-b05d-6f8c2a3e1d47
+name: "Fortinet Application Control Block of High Risk Application"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects FortiGate application control blocks where the application or the application category
+  belongs to a high risk family: peer to peer and torrent clients, proxy and anonymiser tools,
+  cloud storage and consumer file sharing services, and unauthorised remote access or tunnelling
+  utilities. Application control is the control that stops a user dragging data out of the
+  organisation through an unsanctioned channel, so a block in one of these categories is a direct
+  exfiltration or policy bypass attempt rather than a generic web browsing event. The benign case
+  is a user whose work genuinely requires the blocked application, for example a designer using
+  a specific cloud drive, so confirm the business justification and whether the application was
+  explicitly allowed for that user group before closing the alert. The application name is carried
+  in the app field and the application category in the CEF cs1 field or the appcat extension of
+  the raw CEF string, so confirm which of the two the connector populates in the target workspace.
+  MITRE ATT&CK: T1048, T1090
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 15m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Exfiltration
+  - CommandAndControl
+relevantTechniques:
+  - T1048
+  - T1090
+query: |
+  let RiskAppTerms = dynamic([
+      "p2p", "torrent", "bittorrent", "proxy", "socks", "anonymiz", "anonymis",
+      "psiphon", "onion", "dropbox", "onedrive", "drive.google", "icloud",
+      "box.com", "mega", "wetransfer", "pastebin", "filezilla", "anydesk",
+      "teamviewer", "zerotier", "tailscale", "openvpn", "softether"]);
+  let RiskCategoryTerms = dynamic([
+      "p2p", "peer-to-peer", "torrent", "proxy", "anonymiz", "anonymis",
+      "vpn", "cloud", "tunnel", "remote.admin"]);
+  let BlockActions = dynamic(["deny", "blocked", "close", "reset", "timeout"]);
+  CommonSecurityLog
+  | where TimeGenerated > ago(15m)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("app-ctrl", "appctrl") or Activity has_any ("appctrl", "app-ctrl", "app-control")
+  | extend AppName = tostring(ApplicationProtocol)
+  | extend AppCategory = iff(
+      isnotempty(DeviceCustomString1),
+      tostring(DeviceCustomString1),
+      tostring(extract(@"appcat=([^ ]+)", 1, tostring(AdditionalExtensions))))
+  | where AppName has_any (RiskAppTerms) or AppCategory has_any (RiskCategoryTerms)
+  | where tolower(tostring(DeviceAction)) in (BlockActions)
+  | extend RiskClass = case(
+      AppName has_any ("p2p", "torrent", "bittorrent") or AppCategory has_any ("p2p", "peer-to-peer", "torrent"), "Peer to Peer or Torrent",
+      AppName has_any ("proxy", "socks", "anonymiz", "anonymis", "psiphon", "onion") or AppCategory has_any ("proxy", "anonymiz", "anonymis"), "Proxy or Anonymiser",
+      AppName has_any ("dropbox", "onedrive", "drive.google", "icloud", "box.com", "mega", "wetransfer", "pastebin") or AppCategory has_any ("cloud"), "Cloud Storage or File Sharing",
+      AppName has_any ("openvpn", "softether", "anydesk", "teamviewer", "zerotier", "tailscale", "filezilla") or AppCategory has_any ("vpn", "tunnel", "remote.admin"), "Unauthorised Remote Access or Tunnel",
+      "Risky Application Category")
+  | summarize
+      BlockCount    = count(),
+      AppNames      = tostring(make_set(AppName, 10)),
+      AppCategories = tostring(make_set(AppCategory, 10)),
+      Users         = tostring(make_set(SourceUserName, 10)),
+      Account       = arg_max(SourceUserName, TimeGenerated),
+      Destinations  = tostring(make_set(DestinationIP, 10)),
+      SampleURLs    = tostring(make_set(RequestURL, 5)),
+      BytesSent     = sum(SentBytes),
+      FirstSeen     = min(TimeGenerated),
+      LastSeen      = max(TimeGenerated)
+    by SourceIP, RiskClass
+  | extend TotalMBSent = round(toreal(BytesSent) / 1048576, 2)
+  | order by BlockCount desc, TotalMBSent desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+customDetails:
+  BlockCount: BlockCount
+  RiskClass: RiskClass
+  AppNames: AppNames
+  AppCategories: AppCategories
+  Users: Users
+  Destinations: Destinations
+  SampleURLs: SampleURLs
+  TotalMBSent: TotalMBSent
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet App Control Block - {{SourceIP}} ({{RiskClass}})"
+  alertDescriptionFormat: "Application control blocked {{BlockCount}} sessions from {{SourceIP}} in risk class {{RiskClass}}. Applications {{AppNames}}, user(s) {{Users}}, {{TotalMBSent}} MB sent, destinations {{Destinations}}. Review for unsanctioned exfiltration or policy bypass."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT3H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []

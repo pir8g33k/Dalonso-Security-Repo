@@ -3,10 +3,13 @@ name: "Correlation: Firewall Traffic Matching Threat Intelligence Domain / URL"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Matches destination hostnames and URLs from firewall/proxy logs (Fortinet, Palo Alto, Zscaler)
-  against active threat intelligence domain indicators in the ThreatIntelIndicators table.
-  A TI-flagged domain being resolved or accessed through the corporate perimeter — even if not
-  blocked — indicates active C2 communication, phishing activity, or malware staging.
+  Matches destination hostnames and URLs from firewall and proxy logs (Fortinet, Palo
+  Alto, Zscaler) against active threat intelligence domain indicators. A TI-flagged
+  domain being resolved or accessed through the corporate perimeter, even if it was not
+  blocked, indicates active C2 communication, phishing activity or malware staging.
+  The previous version compared a full URL against a bare domain name, so it only
+  matched when the log happened to carry a hostname in a separate column. The hostname
+  is now extracted from the URL before comparison, and both sides are lower-cased.
   MITRE ATT&CK: T1071 (Application Layer Protocol)
 severity: High
 requiredDataConnectors:
@@ -16,8 +19,8 @@ requiredDataConnectors:
   - connectorId: ThreatIntelligence
     dataTypes:
       - ThreatIntelIndicators
-queryFrequency: 15m
-queryPeriod: 1d
+queryFrequency: 1h
+queryPeriod: 1h
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -32,22 +35,33 @@ query: |
       | where ObservableKey has "domain"
       | where isnotempty(ObservableValue)
       | summarize
-          TI_ThreatTypes = make_set(Tags),
+          TI_ThreatTypes = make_set(tostring(Tags), 10),
           TI_Confidence  = max(Confidence)
-        by DomainName = ObservableValue;
+        by DomainName = tolower(tostring(ObservableValue));
   CommonSecurityLog
-  | where TimeGenerated > ago(1d)
+  | where TimeGenerated > ago(1h)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(DestinationHostName) or isnotempty(RequestURL)
-  | extend MatchKey = coalesce(DestinationHostName, RequestURL)
+  // RequestURL is a full URL, not a hostname, so it has to be reduced before it
+  // can be compared with a domain indicator.
+  | extend MatchKey = tolower(tostring(
+      iff(isnotempty(DestinationHostName),
+         DestinationHostName,
+         extract(@"^https?://([^/:?#]+)", 1, tostring(RequestURL)))))
+  | where isnotempty(MatchKey)
   | join kind=inner TI_Domains on $left.MatchKey == $right.DomainName
   | summarize
       FW_HitCount    = count(),
       FW_Users       = make_set(SourceUserName, 10),
       FW_SourceIPs   = make_set(SourceIP, 10),
+      RepresentativeSourceIP = any(SourceIP),
       FW_Actions     = make_set(DeviceAction, 5),
       FW_Vendors     = make_set(DeviceVendor),
-      TI_ThreatTypes = make_set(TI_ThreatTypes),
+      TI_ThreatTypes = make_set(TI_ThreatTypes, 10),
       TI_Confidence  = max(TI_Confidence),
       FirstSeen      = min(TimeGenerated),
       LastSeen       = max(TimeGenerated)
@@ -58,6 +72,10 @@ entityMappings:
     fieldMappings:
       - identifier: DomainName
         columnName: MatchKey
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: RepresentativeSourceIP
 customDetails:
   FW_HitCount: FW_HitCount
   TI_Confidence: TI_Confidence

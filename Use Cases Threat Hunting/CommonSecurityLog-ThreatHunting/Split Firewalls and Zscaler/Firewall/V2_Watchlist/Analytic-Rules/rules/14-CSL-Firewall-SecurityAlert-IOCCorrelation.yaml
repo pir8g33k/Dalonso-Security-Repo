@@ -3,18 +3,20 @@ name: "Correlation: Firewall Traffic + Active Security Alert - Shared IOC IP"
 version: 1.0.0
 kind: Scheduled
 description: |
-  Identifies IP addresses that appear in both active High/Medium Sentinel security alerts
-  (within the last 7 days) and allowed firewall traffic (last 24 hours). Cross-signal
-  correlation between alert IOCs and live firewall activity confirms that a flagged IP is
-  still actively communicating through the network, elevating response priority.
+  Identifies IP addresses that appear both in active High and Medium Sentinel security
+  alerts (last 7 days) and in permitted firewall traffic (last 24 hours). A flagged IP
+  that is still actively communicating through the network stays a live IOC, and
+  confirming that raises response priority above the alert that raised it.
+  The alert side of the correlation is normalised to lower case, so addresses written
+  in different case in the two sources still match.
   MITRE ATT&CK: T1078 (Valid Accounts), T1071 (Application Layer Protocol)
 severity: High
 requiredDataConnectors:
   - connectorId: CommonSecurityEvents
     dataTypes:
       - CommonSecurityLog
-queryFrequency: 1h
-queryPeriod: 7d
+queryFrequency: 1d
+queryPeriod: 1d
 triggerOperator: gt
 triggerThreshold: 0
 tactics:
@@ -30,7 +32,7 @@ query: |
       | where AlertSeverity in ("High", "Medium")
       | mv-expand todynamic(Entities)
       | where Entities.Type == "ip"
-      | extend AlertIP = tostring(Entities.Address)
+      | extend AlertIP = tolower(tostring(Entities.Address))
       | where isnotempty(AlertIP)
       | summarize
           AlertCount    = count(),
@@ -41,8 +43,13 @@ query: |
   CommonSecurityLog
   | where TimeGenerated > ago(1d)
   | where DeviceVendor in ("Fortinet", "Palo Alto Networks", "Zscaler")
+  // Positive allow-list. FortiGate emits act=blocked for UTM blocks and
+  // Palo Alto / Zscaler use their own action verbs, so the previous
+  // deny-list silently counted blocked traffic as permitted.
+  | where tolower(DeviceAction) in ("accept", "allowed", "allow")
   | where isnotempty(SourceIP) or isnotempty(DestinationIP)
-  | extend CheckIP = iff(ipv4_is_private(DestinationIP) == false, DestinationIP, SourceIP)
+  | extend CheckIP = tolower(tostring(iff(ipv4_is_private(DestinationIP) == false,
+                                                  DestinationIP, SourceIP)))
   | summarize
       FW_HitCount     = count(),
       FW_Actions      = make_set(DeviceAction, 5),

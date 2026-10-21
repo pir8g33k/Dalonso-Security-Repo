@@ -1,0 +1,108 @@
+id: 7e1b5c93-4a26-4f79-9c08-1d3e6b8a2f54
+name: "Fortinet SSL-VPN Successful Logon Anomaly"
+version: 1.0.0
+kind: Scheduled
+description: |
+  Detects successful FortiGate SSL-VPN logons that do not fit the established pattern for the
+  source address, the time of day or the number of identities involved. The rule raises an alert
+  when a source IP has never been seen connecting through the VPN before, when the logon happens
+  outside business hours, or when a single source address authenticates many distinct users in the
+  same window. A first seen source is the highest value signal here, because a valid credential
+  used from a new network is exactly what a stolen VPN account looks like, and many distinct users
+  behind one address is the classic shape of credential stuffing or a shared or proxied exit node.
+  The benign case is a staff member or an approved contractor connecting from a new home network
+  or a new mobile carrier address, so check the source address reputation and confirm the user
+  travel before escalating. The historical baseline for the first seen test is a thirty day lookback
+  over the same VPN log categories, so a source that has been in use for longer than thirty days
+  will not raise the first seen condition.
+  MITRE ATT&CK: T1078, T1078.002
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CommonSecurityEvents
+    dataTypes:
+      - CommonSecurityLog
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - InitialAccess
+  - Persistence
+relevantTechniques:
+  - T1078
+  - T1078.002
+query: |
+  let DistinctUserThreshold = 5;
+  let BusinessStartHour = 7;
+  let BusinessEndHour = 19;
+  // 30 day baseline used to decide whether a source IP has been seen on the VPN before.
+  let KnownVpnSources =
+      CommonSecurityLog
+      | where TimeGenerated > ago(30d)
+      | where DeviceVendor == "Fortinet"
+      | where DeviceEventClassID has_any ("sslvpn", "vpn") or Activity has_any ("sslvpn", "ssl-vpn", "vpn")
+      | where isnotempty(SourceIP)
+      | summarize HistFirstSeen = min(TimeGenerated), HistLastSeen = max(TimeGenerated) by SourceIP;
+  CommonSecurityLog
+  | where TimeGenerated > ago(1h)
+  | where DeviceVendor == "Fortinet"
+  | where DeviceEventClassID has_any ("sslvpn", "vpn") or Activity has_any ("sslvpn", "ssl-vpn", "vpn")
+  | where tolower(tostring(DeviceAction)) in ("accept", "close", "success", "allow", "login")
+      or EventOutcome == "Success"
+  | where isnotempty(SourceIP)
+  | extend LogonHour = hour(TimeGenerated)
+  | extend IsOffHours = LogonHour < BusinessStartHour or LogonHour >= BusinessEndHour
+  | summarize
+      LogonCount    = count(),
+      DistinctUsers = dcount(SourceUserName),
+      UserList      = tostring(make_set(SourceUserName, 20)),
+      Account       = arg_max(SourceUserName, TimeGenerated),
+      OffHoursCount = countif(IsOffHours),
+      LogonHours    = tostring(make_set(LogonHour, 12)),
+      Destinations  = tostring(make_set(DestinationIP, 10)),
+      FirstSeen     = min(TimeGenerated),
+      LastSeen      = max(TimeGenerated)
+    by SourceIP
+  | join kind=leftouter KnownVpnSources on $left.SourceIP == $right.SourceIP
+  | extend IsFirstSeenSource = isempty(HistFirstSeen)
+  | where IsFirstSeenSource or OffHoursCount > 0 or DistinctUsers >= DistinctUserThreshold
+  | extend AnomalyType = case(
+      IsFirstSeenSource and DistinctUsers >= DistinctUserThreshold, "New source IP authenticating many distinct users",
+      IsFirstSeenSource and OffHoursCount > 0, "New source IP with off hours logon",
+      DistinctUsers >= DistinctUserThreshold, "Many distinct users from a single source IP",
+      IsFirstSeenSource, "First observed SSL-VPN source IP",
+      "Off hours SSL-VPN logon")
+  | order by DistinctUsers desc, LogonCount desc
+entityMappings:
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: SourceIP
+  - entityType: Account
+    fieldMappings:
+      - identifier: FullName
+        columnName: Account
+customDetails:
+  LogonCount: LogonCount
+  DistinctUsers: DistinctUsers
+  UserList: UserList
+  OffHoursCount: OffHoursCount
+  LogonHours: LogonHours
+  Destinations: Destinations
+  AnomalyType: AnomalyType
+  FirstSeen: FirstSeen
+  LastSeen: LastSeen
+alertDetailsOverride:
+  alertDisplayNameFormat: "Fortinet SSL-VPN Anomaly - {{SourceIP}} ({{AnomalyType}})"
+  alertDescriptionFormat: "SSL-VPN source {{SourceIP}} produced {{LogonCount}} successful logons across {{DistinctUsers}} distinct users ({{OffHoursCount}} outside business hours), classified as {{AnomalyType}}. Users {{UserList}}. Validate whether the account and the source address are legitimate."
+incidentConfiguration:
+  createIncident: true
+  groupingConfiguration:
+    enabled: true
+    reopenClosedIncident: false
+    lookbackDuration: PT5H
+    matchingMethod: Selected
+    groupByEntities:
+      - IP
+    groupByAlertDetails: []
+    groupByCustomDetails: []
